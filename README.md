@@ -174,7 +174,7 @@ cd <這個 repo 的根目錄>
 mkdir -p repos && cd repos
 
 git clone --recursive https://github.com/StanfordMSL/SousVide.git
-git clone https://github.com/Zhefan-Xu/grad_nav.git      # 若網址有變，見 CLAUDE.md 第「參考資料」節
+git clone https://github.com/Qianzhong-Chen/grad_nav.git
 ```
 
 `--recursive` 不能省，FiGS 是 SousVide 的 submodule。
