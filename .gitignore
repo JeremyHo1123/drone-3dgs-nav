@@ -1,0 +1,30 @@
+# 本 repo 只追蹤「自己寫的程式與文件」。
+# 資料（影片、影像、點雲）、訓練產物（ckpt）、上游 repo 一律不追蹤：
+# 它們合計約 49 GB，且都可以從來源重新取得或重新產生。
+
+# ── 預設忽略專案根目錄下的所有東西 ──
+/*
+
+# ── 放行 ──
+!/.gitignore
+!/README.md
+!/CLAUDE.md
+!/implement.md
+!/tools/
+!/notes/
+!/configs/
+
+# ── notes/ 底下只要文字，圖片與 log 留在本機 ──
+notes/**/*.png
+notes/**/*.jpg
+notes/**/*.jpeg
+notes/**/*.log
+
+# ── 不論在哪一層都不追蹤 ──
+*.ckpt
+*.ply
+*.MOV
+*.mp4
+*.zip
+*.pyc
+__pycache__/
