@@ -1,112 +1,155 @@
-# 客製化無人機視覺導航訓練環境
+# drone-3dgs-nav
 
-用手機錄影重建**公制尺度**的 3D Gaussian Splatting 場景，餵給可微分 RL 訓練無人機視覺導航策略，最終部署到真機。
+Building a **metric-scale** 3D Gaussian Splatting environment from a hand-held phone video, so a drone visual-navigation policy can be trained in it and then deployed on real hardware.
 
-專案的完整背景、技術選型理由、預期管理與已知限制寫在 [`CLAUDE.md`](CLAUDE.md)。**開始動手之前先讀那一份**，這份 README 只講「怎麼把環境裝起來、怎麼跑」。
+Two upstream projects are joined here, both from Stanford's Multi-Robot Systems Lab:
 
----
-
-## 這個 repo 裡有什麼、沒有什麼
-
-| | 內容 |
-|---|---|
-| **有** | 自己寫的 11 個腳本（`tools/`）、逐章實作筆記（`notes/*.md`）、相機標定與拍攝設定（`configs/`）、專案說明（`CLAUDE.md`、`implement.md`） |
-| **沒有** | 上游 repo（SousVide、grad_nav）、拍攝影片、抽出的影像、SfM 中間產物、訓練好的 checkpoint、點雲 |
-
-沒有的那些合計約 49 GB，都能重新取得或重新產生，所以不放進 git。下面每一節會說明怎麼補齊。
-
----
-
-## 0. 前置需求
-
-| 項目 | 需求 | 說明 |
+| Part | Source | Why |
 |---|---|---|
-| GPU | NVIDIA，**建議 Blackwell（sm_120）** | 本專案在 RTX 5070 Ti 與 RTX PRO 6000 上驗證過 |
-| CUDA toolkit | **12.8 以上**，裝在系統層（`/usr/local/cuda`） | 用 `nvcc --version` 確認 |
-| conda | 任一版本（Anaconda / Miniconda 皆可） | |
-| OS | Ubuntu 24.04 | 其他版本未測 |
+| Scene reconstruction | **FiGS**, from [SousVide](https://github.com/StanfordMSL/SousVide) | The only open pipeline that goes phone video → metric 3DGS, with ArUco for scale |
+| Policy training | [**GRaD-Nav++**](https://arxiv.org/abs/2506.14009) | Differentiable RL — no MPC expert, no demonstrations, 3.5 h of training, language-conditioned |
 
-### ⚠️ 為什麼 CUDA 版本這麼要緊
+They share scene formats and vehicle configs, but **nobody has connected them before**. That junction is the main engineering work of this project.
 
-SousVide 官方的 `environment_x86.yml` 鎖死 `pytorch-cuda=11.8`。**CUDA 11.8 最高只支援 sm_90（Hopper），完全不認得 sm_120（Blackwell）。**
+Project background, rationale, and known limitations of this approach are in [`CLAUDE.md`](CLAUDE.md). Read that first if you intend to reuse this.
 
-直接用官方的 yml 會裝出一個「能安裝但跑不動」的環境。症狀是執行到一半才報：
+> **Language note.** This README is in English. The chapter-by-chapter implementation notes in [`notes/`](notes/) are in Traditional Chinese — they carry the reasoning behind every deviation from the upstream instructions, so they are worth translating if you get stuck.
+
+---
+
+## Example scene: `scene04`
+
+A tree-lined outdoor plaza, reconstructed from a single 5-minute iPhone 12 video and **verified metric to within 0.87%**.
+
+![scene map](scenes/scene04/figures/scene_map.png)
+
+| | |
+|---|---|
+| Box stack measured in the point cloud | **172.5 cm** |
+| Same stack measured with a tape | **171.0 cm** |
+| **Error** | **+0.87%** (threshold: < 2%) |
+| Ground plane tilt | 1.14° from vertical |
+| Ground flatness, RMS over 30 m | 5.5 mm |
+
+The dense point cloud is checked into this repo — **26 MB, no GPU or setup needed to open it**:
+
+```python
+import open3d as o3d
+o3d.visualization.draw_geometries([
+    o3d.io.read_point_cloud("scenes/scene04/scene04_dense.ply")])
+```
+
+The frame is metric and gravity-aligned: origin at the ArUco tag, +z up, ground at z ≈ −0.02 m, distances in metres.
+
+The 1.8 GB trained checkpoint is on the [Releases page](../../releases) — too large for a git repo. Full details, the file layout it needs, and the three things that break loading are in [`scenes/scene04/README.md`](scenes/scene04/README.md).
+
+---
+
+## What is in this repo
+
+| | |
+|---|---|
+| [`tools/`](tools/) | 14 scripts — calibration, ArUco, frame extraction, mapping, scale verification, export, evaluation, dynamics checks |
+| [`notes/`](notes/) | Chapter-by-chapter implementation records (Traditional Chinese), including every deviation from upstream and why |
+| [`configs/`](configs/) | Camera intrinsics and capture configs |
+| [`scenes/scene04/`](scenes/scene04/) | A complete, scale-verified example scene |
+| [`CLAUDE.md`](CLAUDE.md) | Project goals, constraints, expectation management |
+| [`implement.md`](implement.md) | The original chapter-by-chapter plan (Traditional Chinese) |
+
+**Not in this repo:** the upstream repos, capture videos, extracted images, SfM intermediates, and training checkpoints — about 49 GB in total. All of it is either downloadable or reproducible. Each section below says how.
+
+---
+
+## 0. Prerequisites
+
+| | Requirement | Check with |
+|---|---|---|
+| GPU | NVIDIA. **Blackwell (sm_120) recommended** — verified on RTX 5070 Ti and RTX PRO 6000 | `nvidia-smi` |
+| CUDA toolkit | **12.8 or newer**, installed system-wide at `/usr/local/cuda` | `nvcc --version` |
+| conda | Any distribution | `conda --version` |
+| OS | Ubuntu 24.04 | others untested |
+
+### ⚠️ Why the CUDA version matters
+
+SousVide's official `environment_x86.yml` pins `pytorch-cuda=11.8`. **CUDA 11.8 tops out at sm_90 (Hopper) and does not recognise sm_120 (Blackwell) at all.**
+
+Using that file gives you an environment that installs cleanly and then fails at runtime:
 
 ```
 no kernel image is available for execution on the device
 ```
 
-所以下面的安裝步驟**不使用官方 yml**，全部手動指定版本。
+So the steps below **do not use the official yml**. Every version is pinned by hand.
 
 ---
 
-## 1. 安裝環境
+## 1. Environment setup
 
-總共要建**兩個** conda 環境。分開的理由寫在第 1.3 節。
+Two conda environments. The reason they are separate is in section 1.3.
 
-### 1.1 主環境 `droneenv`
+### 1.1 Main environment `droneenv`
 
 ```bash
 conda create -n droneenv python=3.10 -y
 conda activate droneenv
 ```
 
-**接下來的安裝順序不能調換**，理由寫在每一步下面。
+**The order below matters.** Each step explains why.
 
-**第一步：PyTorch（cu128 版）**
+**Step 1 — PyTorch, cu128 build**
 
 ```bash
 pip install torch==2.11.0 torchvision==0.26.0 \
   --index-url https://download.pytorch.org/whl/cu128
 ```
 
-**第二步：nerfstudio**
+**Step 2 — nerfstudio**
 
 ```bash
 pip install nerfstudio==1.1.5
 ```
 
-這一步會把 numpy 降到 `1.26.4`。**這是預期行為，不要去升回來** —— nerfstudio 1.1.5 不相容 numpy 2.x，而 torch 2.11 和 1.26.4 相處得很好。
+This downgrades numpy to `1.26.4`. **That is expected — do not undo it.** nerfstudio 1.1.5 is not numpy 2.x compatible, and torch 2.11 is fine with 1.26.4.
 
-**第三步：gsplat（必須從源碼編譯，且必須在 nerfstudio 之後）**
+**Step 3 — gsplat, built from source, after nerfstudio**
 
 ```bash
 export TORCH_CUDA_ARCH_LIST="12.0"
-export MAX_JOBS=12          # 依機器核心數調整，記憶體小的機器改成 4
+export MAX_JOBS=12          # scale to your core count; use 4 on low-RAM machines
 export CUDA_HOME=/usr/local/cuda
 
 pip install --no-build-isolation --force-reinstall --no-deps \
   "git+https://github.com/nerfstudio-project/gsplat.git@v1.4.0"
 ```
 
-三個要注意的地方：
+Three things to get right:
 
-1. **順序**：gsplat 必須裝在 nerfstudio **之後**。反過來的話，nerfstudio 的相依會把你編好的版本用 PyPI wheel 蓋掉
-2. **版本號是 1.4.0，不是最新版**：nerfstudio 1.1.5 精確鎖定 `gsplat ==1.4.0`。裝最新版會留下版本衝突
-3. **為什麼要自己編**：PyPI 上的 `gsplat-1.4.0` 是 `py3-none-any` 的純 JIT wheel，裡面沒有預編好的 `.so`。它不會馬上報錯，而是等到第一次呼叫渲染時才用本機 nvcc 現場編譯 —— 風險是訓練跑到一半停頓，編譯失敗就整場報銷。自己編是 AOT（ahead-of-time，事先編好），可以完全避開這個風險
+1. **Order.** gsplat must be installed *after* nerfstudio, or nerfstudio's dependency resolution overwrites your build with the PyPI wheel.
+2. **Version 1.4.0, not latest.** nerfstudio 1.1.5 pins `gsplat ==1.4.0` exactly.
+3. **Why build from source.** The PyPI `gsplat-1.4.0` is a `py3-none-any` JIT-only wheel with no compiled `.so`. It does not fail immediately — it compiles on the first render call using the local nvcc. That means a stall in the middle of training, and a lost run if compilation fails. Building ahead of time removes that risk entirely.
 
-**第四步：換掉 opencv**
+**Step 4 — swap OpenCV**
 
 ```bash
 pip uninstall -y opencv-python-headless
 pip install opencv-contrib-python==4.10.0.84
 ```
 
-nerfstudio 鎖定 `opencv-python-headless==4.10.0.84`，但那個版本**沒有 ArUco 模組**，而本專案的公制定尺度完全靠 ArUco。`opencv-contrib-python` 是同版本的功能超集。
+nerfstudio pins `opencv-python-headless==4.10.0.84`, which **has no ArUco module** — and ArUco is the only thing in this pipeline that knows how long a metre is. `opencv-contrib-python` is the same version with a superset of features.
 
-pip 之後會留下一行「未滿足的版本宣告」警告，**那是預期的，可以忽略**。
+pip will leave an unsatisfied-requirement warning afterwards. **That is expected.**
 
-**第五步：其他相依**
+**Step 5 — remaining dependencies**
 
 ```bash
 pip install open3d==0.19.0 gym==0.26.2
 ```
 
-### 1.2 隔離 ROS 2 的 PYTHONPATH（如果機器上有裝 ROS 2）
+### 1.2 Isolate a leaked ROS 2 PYTHONPATH
 
-如果系統全域設了 `PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages`，它會插在 `sys.path` 的**第一順位**。那是 python 3.12 的目錄，而 `droneenv` 是 3.10 —— ABI 不同，任何撞名的套件都會蓋掉環境內的正版。
+If the machine sets `PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages` globally, it lands **first** on `sys.path`. That is a python 3.12 package directory and `droneenv` is 3.10 — incompatible ABI, and any name collision shadows the real package.
 
-處理方式是只在這個 env 內清掉它：
+Clear it inside this environment only:
 
 ```bash
 mkdir -p $CONDA_PREFIX/etc/conda/activate.d $CONDA_PREFIX/etc/conda/deactivate.d
@@ -122,30 +165,30 @@ unset _DRONEENV_SAVED_PYTHONPATH
 EOF
 ```
 
-`activate.d` 裡的腳本會在 `conda activate` 時自動執行，`deactivate.d` 則在離開時還原。**全域的 ROS 2 不受影響。**
+Scripts in `activate.d` run on `conda activate`; `deactivate.d` restores on exit. **The global ROS 2 install is untouched.**
 
-### 1.3 輔助環境 `sfmtools`（COLMAP + ffmpeg）
+### 1.3 Helper environment `sfmtools` (COLMAP + ffmpeg)
 
 ```bash
 conda create -n sfmtools -y
 conda activate sfmtools
 conda install -c conda-forge "colmap=4.0.*" "libfaiss=1.10.*" ffmpeg -y
 
-# 釘住版本，避免日後 conda 操作把它們升級弄壞
+# pin, so a later conda operation cannot upgrade them and break things
 printf 'libfaiss 1.10.*\ncolmap 4.0.*\n' > $CONDA_PREFIX/conda-meta/pinned
 ```
 
-**為什麼要獨立一個 env：** 直接把 colmap 裝進 `droneenv` 會拉進 qt-main 5.15 + pango + nss + 整套 xorg。那組 Qt 會和 open3d 的視覺化打架。
+**Why a separate environment.** Installing colmap into `droneenv` pulls in qt-main 5.15, pango, nss and a full xorg stack. That Qt conflicts with Open3D's visualisation.
 
-**為什麼要釘 libfaiss 1.10：** conda-forge 的 colmap 套件**沒有宣告 faiss 相依**。裝完直接執行會死在：
+**Why libfaiss must be pinned.** The conda-forge colmap package **does not declare its faiss dependency**. Run it as-is and it dies with:
 
 ```
 undefined symbol: faiss::IndexIVFFlat::IndexIVFFlat(Index*, ulong, ulong, MetricType)
 ```
 
-新版 faiss（1.12 以上）改了那個建構子的簽章。釘在 1.10 就沒事。
+faiss 1.12+ changed that constructor signature. Pinning to 1.10 avoids it.
 
-**把 colmap 與 ffmpeg 接到 droneenv：**
+**Expose colmap and ffmpeg to droneenv:**
 
 ```bash
 conda activate droneenv
@@ -161,34 +204,34 @@ unset _DRONEENV_SAVED_PATH
 EOF
 ```
 
-**`$PATH` 後面而不是前面是刻意的。** `droneenv` 自己的 python 必須優先，不能被 `sfmtools` 的 python 蓋掉。conda-forge 的執行檔用 RPATH `$ORIGIN/../lib` 找自己的相依，所以那套 Qt 不會滲進來。
+**Appending rather than prepending is deliberate.** droneenv's own python must win; it must not be shadowed by sfmtools' python. conda-forge binaries resolve their own dependencies through `RPATH $ORIGIN/../lib`, so that Qt stack never leaks in.
 
-**為什麼非裝這兩個執行檔不可：** nerfstudio 的 `ColmapConverterToNerfstudioDataset.__post_init__` **無條件**呼叫 `check_ffmpeg_installed()` 與 `check_colmap_installed()`，失敗就 `sys.exit(1)`。即使我們用 `sfm_tool="hloc"`（hloc 內部用 pycolmap，根本不需要執行檔）也照樣被擋。
+**Why these two executables are mandatory:** nerfstudio's `ColmapConverterToNerfstudioDataset.__post_init__` calls `check_ffmpeg_installed()` and `check_colmap_installed()` unconditionally and `sys.exit(1)`s on failure — even with `sfm_tool="hloc"`, which uses pycolmap internally and needs neither executable.
 
 ---
 
-## 2. 取得上游 repo
+## 2. Upstream repositories
 
 ```bash
-cd <這個 repo 的根目錄>
+cd <repo root>
 mkdir -p repos && cd repos
 
 git clone --recursive https://github.com/StanfordMSL/SousVide.git
 git clone https://github.com/Qianzhong-Chen/grad_nav.git
 ```
 
-`--recursive` 不能省，FiGS 是 SousVide 的 submodule。
+`--recursive` is required — FiGS is a submodule of SousVide.
 
-### ⚠️ 不需要編譯 acados
+### ⚠️ acados is not needed
 
-SousVide 的安裝說明會叫你編 acados。**本專案不需要。** acados 只是它做 imitation learning 資料合成時的 MPC 求解器，而我們走 GRaD-Nav++ 的可微分 RL 路線，完全不用那條管線。這省掉整個安裝流程裡最痛的一段。
+SousVide's install instructions tell you to build acados. **Skip it.** acados is only the MPC solver used to synthesise imitation-learning data, and this project takes the GRaD-Nav++ differentiable-RL route instead. That removes the most painful part of the whole install.
 
-### 把自己的設定檔放回上游 repo 的位置
+### Put the capture configs where the tools expect them
 
-`tools/build_gsplat.py` 到 `repos/SousVide/configs/` 底下讀設定，所以要複製過去：
+`tools/build_gsplat.py` reads configs from `repos/SousVide/configs/`:
 
 ```bash
-cd <這個 repo 的根目錄>
+cd <repo root>
 mkdir -p repos/SousVide/configs/captures repos/SousVide/configs/camera
 cp configs/captures/*.json repos/SousVide/configs/captures/
 cp configs/camera/*.json   repos/SousVide/configs/camera/
@@ -196,304 +239,292 @@ cp configs/camera/*.json   repos/SousVide/configs/camera/
 
 ---
 
-## 3. 驗證環境（不要跳過）
+## 3. Verify the environment
 
-這條管線的失敗**多半是無聲的** —— 不報錯，只是結果變差。所以每一步都要當場驗。
+**Failures in this pipeline are usually silent** — nothing errors, the result is just worse. Verify at every step.
 
 ```bash
 conda activate droneenv
 python - << 'EOF'
 import torch, gsplat, cv2, open3d, numpy
-print("torch      :", torch.__version__)
-print("CUDA 可用  :", torch.cuda.is_available())
-print("GPU 能力   :", torch.cuda.get_device_capability())   # Blackwell 要是 (12, 0)
-print("arch list  :", torch.cuda.get_arch_list())           # 要含 'sm_120'
-print("gsplat     :", gsplat.__version__)                   # 要是 1.4.0
-print("cv2        :", cv2.__version__, "| aruco:", hasattr(cv2, "aruco"))
-print("open3d     :", open3d.__version__)
-print("numpy      :", numpy.__version__)                    # 要是 1.26.x
+print("torch     :", torch.__version__)
+print("cuda ok   :", torch.cuda.is_available())
+print("capability:", torch.cuda.get_device_capability())   # (12, 0) on Blackwell
+print("arch list :", torch.cuda.get_arch_list())           # must contain 'sm_120'
+print("gsplat    :", gsplat.__version__)                   # must be 1.4.0
+print("cv2       :", cv2.__version__, "| aruco:", hasattr(cv2, "aruco"))
+print("open3d    :", open3d.__version__)
+print("numpy     :", numpy.__version__)                    # must be 1.26.x
 EOF
 ```
 
-**只驗 `import gsplat` 是不夠的。** 本專案走可微分 RL，梯度必須穿得過渲染器，所以前向和反向都要實跑：
+**`import gsplat` alone is not enough.** This project uses differentiable RL, so gradients have to flow back through the rasteriser — exercise both directions, and confirm the compiled `.so` really contains sm_120 machine code rather than waiting to JIT:
 
 ```bash
 python - << 'EOF'
-import torch, gsplat
-# 確認 .so 內真的是 sm_120 機器碼，而不是等著 JIT 現編
-import glob, subprocess, os
-so = glob.glob(os.path.join(os.path.dirname(gsplat.__file__), "*.so"))
-print("編出來的 .so:", so)
+import glob, os, gsplat
+print("compiled .so:", glob.glob(os.path.join(os.path.dirname(gsplat.__file__), "*.so")))
 EOF
+cuobjdump --list-elf $(python -c "import glob,os,gsplat;print(glob.glob(os.path.join(os.path.dirname(gsplat.__file__),'*.so'))[0])") | head
 ```
 
-再確認 nerfstudio 的四個執行檔都在，且 colmap / ffmpeg 找得到：
+Then confirm the nerfstudio executables and the two helper binaries resolve:
 
 ```bash
-ns-train --help  > /dev/null && echo "ns-train  ok"
-ns-viewer --help > /dev/null && echo "ns-viewer ok"
-ns-export --help > /dev/null && echo "ns-export ok"
+for c in ns-train ns-viewer ns-export ns-process-data; do
+  command -v $c >/dev/null && echo "$c ok" || echo "$c MISSING"
+done
 colmap -h 2>&1 | head -1
 ffmpeg -version | head -1
 ```
 
 ---
 
-## 4. 完整使用流程
+## 4. Building a scene
 
-### 4.1 相機標定（每支手機做一次）
+### 4.1 Camera calibration (once per phone)
 
-用手機錄一段**棋盤格**的影片，各種角度和距離都要有。
+Record a video of a printed checkerboard from many angles and distances.
 
 ```bash
-# 產生棋盤格 PDF，印出來貼在硬板上（不能有皺摺）
-python tools/make_checkerboard.py
-
-# 標定
-python tools/calibrate_camera.py --video captures/<你的影片>.MOV --name <手機名稱>
+python tools/make_checkerboard.py                 # printable PDF
+python tools/calibrate_camera.py --video captures/<video>.MOV --name <phone>
 ```
 
-**驗收標準：重投影誤差要小於 0.5 px。** 沒過就重錄，不要將就 —— 內參錯了，後面每一步都跟著錯。
+Output lands in `configs/camera/<phone>.json`.
 
-輸出會落在 `configs/camera/<手機名稱>.json`。
+**Reprojection error must be under 0.5 px — but see section 6.1 before trusting the focal length.** A low reprojection error does not mean an accurate `fx`, and `fx` is what sets your scene's scale.
 
-### 4.2 產生 ArUco tag 與拍攝設定
+### 4.2 ArUco tag and capture config
 
-ArUco tag 是場景裡的一張印出來的黑白方塊圖案，用來給場景定出**公制尺度**。它是整條管線裡唯一知道「1 公尺有多長」的東西。
+The ArUco tag is a printed black-and-white square placed in the scene. **It is the only thing in the entire pipeline that knows how long a metre is.**
 
 ```bash
-# 產生 tag（A4 或 A3），印出來後量實際邊長
-python tools/make_aruco.py --page 210 297
+python tools/make_aruco.py --page 210 297        # A4; use 297 420 for A3
 
-# 建立拍攝設定，marker-length 填「你量到的實際邊長，單位是公尺」
 python tools/make_capture_config.py \
-  --name <設定名稱> \
+  --name <config-name> \
   --marker-length 0.144 \
-  --num-images 300
+  --num-images 600
 ```
 
-⚠️ **`--marker-length` 一定要量印出來的實體，不要用檔名上的數字。** 印表機的縮放設定會讓實際尺寸和設計尺寸差幾個百分比，而這個誤差會**原封不動變成整個場景的尺度誤差**。
+⚠️ **`--marker-length` must be the measured side of the printed black square, in metres — not the design value.** Printer scaling shifts this by a few percent, and that error passes straight through to your scene scale.
 
-### 4.3 拍攝
+### 4.3 Capture
 
-手持手機繞著場景走，要求：
+Hand-hold the phone and walk the scene:
 
-- ArUco tag 至少要在 20 張影像裡清楚可見（對應設定裡的 `num_marked`）
-- 覆蓋要完整，避免只從一個方向拍
-- 動作要慢，動態模糊會讓 SfM 註冊失敗
+- The ArUco tag must be clearly visible in **at least `num_marked` frames** (default 20)
+- **Walk a loop, and vary your height** — crouch, stand, reach up. A straight-line path produces a degenerate reconstruction that passes every SfM check and still fails on scale (see `notes/07-scene-experiments.md`)
+- Move slowly; motion blur causes SfM registration failures
+- Keep the camera pointed at things with texture, not blank walls
 
-把影片放到：
+Put the video here, with the scene name in the filename, matching exactly one file:
 
 ```
-repos/SousVide/gsplats/capture/<檔名裡要含場景名稱>.MOV
+repos/SousVide/gsplats/capture/<something-with-scenename>.MOV
 ```
 
-**檔名必須含場景名稱，且該名稱在 `capture/` 底下只能配到一個檔案**，否則腳本會直接停下來。
-
-拍完先做預檢：
+Then pre-check it:
 
 ```bash
-python tools/preflight_capture.py --video <影片路徑> --config <設定名稱>
+python tools/preflight_capture.py --video <video> --config <config-name>
 ```
 
-### 4.4 建圖
-
-分五個階段，**建議一階段一階段跑**，不要一次 `--stage all`：
+### 4.4 Run the pipeline
 
 ```bash
-cd <這個 repo 的根目錄>
-conda activate droneenv
-
-python tools/build_gsplat.py --scene <場景名> --config <設定名稱> --stage frames
-python tools/build_gsplat.py --scene <場景名> --config <設定名稱> --stage sfm
-python tools/build_gsplat.py --scene <場景名> --config <設定名稱> --stage check   # ← 檢查點
-python tools/build_gsplat.py --scene <場景名> --config <設定名稱> --stage scale
-python tools/build_gsplat.py --scene <場景名> --config <設定名稱> --stage train
+./tools/run_pipeline.sh --scene scene05 --config iphone12_600
 ```
 
-| 階段 | 做什麼 |
-|---|---|
-| `frames` | 從影片抽幀 |
-| `sfm` | 用 hloc 做 Structure-from-Motion，算出每張影像的相機位置 |
-| `check` | **只檢查、不改任何東西**：確認含 tag 的影像有沒有全部被 SfM 註冊 |
-| `scale` | 用 ArUco 定出公制尺度，寫出 `transforms.json` 與 `sparse_pc.ply` |
-| `train` | 跑 `ns-train splatfacto`，輸出直接串流到畫面 |
-
-**`check` 階段為什麼獨立出來：** 如果含 tag 的影像有幾張沒被 SfM 註冊，下游會拋 `Mismatched number of aruco and sfm transforms`，而那時 SfM 已經白跑一小時了。
-
-`--select` 可以選抽幀策略：`uniform`（原作者作法，預設）或 `sharp`（在時間箱內挑最銳利的一張）。
-
-### ⚠️ 三個保尺度旗標
-
-`--stage train` 內部跑的是：
+That runs every stage in order. You can also run a subset:
 
 ```bash
-ns-train splatfacto ... nerfstudio-data \
-  --orientation-method none \
-  --center-method none \
-  --auto-scale-poses False
+./tools/run_pipeline.sh --scene scene05 --config iphone12_600 --stages scale,train,export
 ```
 
-這三個旗標的 nerfstudio 預設值分別是 `up` / `poses` / `True`，而**三個預設值正好都會摧毀公制尺度**。它們屬於 `nerfstudio-data` 這個 dataparser，必須寫在 `nerfstudio-data` 之後才有效。
-
-`build_gsplat.py` 已經處理好了。手動跑 `ns-train` 時要自己記得加。
-
-### 4.5 驗證尺度（這是生命線）
-
-```bash
-python tools/verify_scale.py --scene <場景名> --pick
-```
-
-`--pick` 會開一個互動視窗讓你點兩個點，量出它們的距離。
-
-**驗收標準：量場景中已知長度的物體，誤差要小於 2%。**
-
-尺度錯了不會報錯，只會讓後面的動力學、避障閾值（0.5 m）、reward 全部連帶錯誤，而且表現差得莫名其妙。**這一步不能跳。**
-
-### 4.6 匯出點雲與評估
-
-```bash
-# 匯出稠密點雲，給 reward 計算與 A* 路徑規劃用
-python tools/export_pointcloud.py \
-  --config repos/SousVide/gsplats/workspace/outputs/<場景名>/splatfacto/<時間戳>/config.yml \
-  --out repos/SousVide/gsplats/workspace/exports/<場景名>_dense.ply
-
-# 渲染品質評估（PSNR + 離軌偏移測試）
-python tools/eval_gsplat.py --config <同上的 config.yml> --tag <場景名>
-
-# 畫場景俯視圖，確認閘門/通道中間沒有雜訊點
-python tools/plot_scene_map.py --scene <場景名>
-```
-
----
-
-## 5. 場景在機器之間的搬移
-
-這一節是**實測結果**，不是推測。測試方式：只複製下面列出的檔案到一個全新的空目錄，用 grad_nav 相同的 `eval_setup(config_path, test_mode="inference")` 載入，確認成功並讀出 1,401,340 個高斯點。
-
-### 最小必要檔案：只有 4 個
-
-以場景 `scene01`、訓練時間戳 `2026-08-13_083816` 為例：
-
-```
-workspace/                                   ← 執行指令時的工作目錄
-├── scene01/
-│   └── transforms.json                      ← 260 KB
-└── outputs/scene01/splatfacto/2026-08-13_083816/
-    ├── config.yml                           ← 12 KB
-    ├── dataparser_transforms.json           ← 1 KB
-    └── nerfstudio_models/
-        └── step-000029999.ckpt              ← 956 MB
-```
-
-總共約 **956 MB**，幾乎全是那個 checkpoint。
-
-### 不需要搬的東西
-
-| 不用搬 | 原本大小 | 說明 |
+| Stage | What it does | Time for 600 images |
 |---|---|---|
-| `scene01/images/` | 620 MB | **實測確認不需要**。載入時只讀 `transforms.json` 拿相機位姿，不開影像檔 |
-| `scene01/sfm/` | 1.3 GB | SfM 中間產物，`transforms.json` 產出後就沒用了 |
-| `scene01/sparse_pc.ply` | 1.3 MB | 沒有它只會印 open3d 的警告，載入照樣成功。但它很小，建議還是帶著 |
+| `frames` | Extract frames by 1-D farthest point sampling | ~6 min |
+| `sfm` | hloc SuperPoint + SuperGlue, exhaustive matching | **~2 h 40 min** |
+| `check` | Verify registration rate and tag-frame count — **changes nothing** | seconds |
+| `scale` | Solve `Sim(3)` from ArUco, write metric `transforms.json` | ~40 s |
+| `train` | `ns-train splatfacto`, 30k steps | ~20 min |
+| `export` | Back-project a dense point cloud | ~27 min |
+| `verify` | Automatic ground-plane and plane-distance checks | ~1 min |
 
-原本 1.9 GB 的場景，搬移只需要 956 MB。
+**`check` is a separate stage on purpose.** If the tag-bearing frames are not all registered, the downstream step throws `Mismatched number of aruco and sfm transforms` — and by then SfM has already burned hours.
 
-### 三個會讓搬移失敗的陷阱
+**SfM cost is quadratic in image count.** Exhaustive matching compares every pair:
 
-**1. 資料夾名稱必須和 config.yml 裡的時間戳一模一樣**
-
-checkpoint 的路徑是從 `config.yml` 裡的 `timestamp` 欄位**重新組出來**的，不是相對於 config.yml 自己的位置。我測試時把資料夾改名成 `T`，結果就報：
-
-```
-No checkpoint directory found at outputs/scene01/splatfacto/2026-08-13_083816/nerfstudio_models
-```
-
-**不要改任何一層資料夾的名字。**
-
-**2. 路徑是相對的，工作目錄必須正確**
-
-`config.yml` 裡存的是相對路徑：
-
-```yaml
-data: scene01
-output_dir: outputs
-```
-
-所以執行指令時的**工作目錄必須是 `scene01/` 和 `outputs/` 的共同上層**（也就是 `workspace/`）。在別的地方跑會找不到檔案。
-
-**3. 兩台機器的 gsplat 版本要一致**
-
-checkpoint 存的是高斯參數張量。載入端的 gsplat 若不是 1.4.0，張量結構對不上就會出錯。兩台都照第 1 節裝就沒問題。
-
-### 搬移指令
-
-在**接收端**這台跑（把 `<場景名>` 和 `<時間戳>` 換成實際值）：
-
-```bash
-W=repos/SousVide/gsplats/workspace
-SCENE=scene01
-TS=2026-08-13_083816
-
-mkdir -p $W/$SCENE $W/outputs/$SCENE/splatfacto/$TS/nerfstudio_models
-
-rsync -avP pro_6000:drone/$W/$SCENE/transforms.json      $W/$SCENE/
-rsync -avP pro_6000:drone/$W/$SCENE/sparse_pc.ply        $W/$SCENE/
-rsync -avP pro_6000:drone/$W/outputs/$SCENE/splatfacto/$TS/  \
-           $W/outputs/$SCENE/splatfacto/$TS/
-```
-
-`rsync -avP` 的 `-P` 會顯示進度並支援中斷續傳，傳 956 MB 時很有用。
-
-### 只是想「看看」場景長什麼樣
-
-那更簡單，只要一個 `.ply` 檔（約 26 MB），不需要 checkpoint 也不需要 nerfstudio：
-
-```bash
-rsync -avP pro_6000:drone/repos/SousVide/gsplats/workspace/exports/<場景名>_dense.ply .
-```
-
-用任何 3DGS 檢視器打開就好。
-
----
-
-## 6. 已知的硬編碼陷阱
-
-`grad_nav` 有數處寫死了原作者的硬體與場景（他們的無人機代號是 `carl`）。換成自己的環境時**必定要改**：
-
-| 檔案 | 硬編碼內容 | 要改成 |
+| Images | Pairs | SfM time |
 |---|---|---|
-| `utils/gs_local.py` | 相機內參 `fx=462.956, fy=463.002, cx=323.076, cy=181.184`（640×360） | 這是 RealSense D435 的值，換成你機上相機的內參 |
-| `utils/gs_local.py` | `pose2nerf_transform()` 內的三個常數矩陣 | 其中 `T_r2d` 是相機在機體上的**安裝外參**（原作者是前 15.2 cm、下傾 8°） |
-| `utils/gs_local.py` 與 `envs/*.py` | 各有一份 `maps` 字典 | **兩邊都要加**自己的場景名稱 |
-| `envs/drone_long_traj.py` | `gs_origin_offset = [-6.0, 0, 0]` | 依自己場景的原點調整 |
-| `envs/drone_vla_*.py` | `task_table` | 指令字串與對應 waypoint，換成自己的任務 |
+| 300 | 44,850 | 30 min (measured) |
+| 600 | 179,700 | 2 h 40 min (measured) |
+| 1000 | 499,500 | ~5.5 h |
+| 5000 | 12,497,500 | ~6 days |
 
-修改上游程式碼時**要記錄改了哪裡與為什麼**。
+More images is not better past a point. On the same video with the same path, 300 → 400 images changed eval PSNR from 21.12 to 20.86. **Trajectory shape dominates; image count does not.**
+
+### 4.5 Verify the scale — do not skip this
+
+```bash
+./tools/open_pointcloud.sh scene05
+```
+
+Shift + left-click two points, press Q, and the distance is printed. **Measure something you can physically reach with a tape. The error must be under 2%.**
+
+Getting scale wrong does not raise an error. It silently corrupts the dynamics, the 0.5 m obstacle threshold, and the reward.
+
+### 4.6 Prepare the cloud for training
+
+```bash
+python tools/prepare_pointcloud.py     # outlier removal, voxel downsample, validation
+python tools/verify_dynamics.py        # quadrotor parameter sanity checks
+python tools/fly_orbit_preview.py      # fly a real simulated orbit, render the view
+```
+
+Downsampling is not optional: grad_nav's `ObstacleDistanceCalculator` builds four `[num_envs, num_points, 3]` tensors at once. At 128 environments, scene04's 978k points would need about 4 GB on top of the Gaussians. Under 100k points keeps it near 0.4 GB.
 
 ---
 
-## 7. 給 AI 助手的工作規範
+## 5. Viewing a scene
 
-- **對話與文件一律使用繁體中文**，專有名詞（3DGS、ArUco、splatfacto、VLA 等）保留英文
-- **尺度正確性是本專案的生命線**。任何涉及尺度的步驟都要當場驗證，不要留到後面
-- **不要跳過驗證步驟**，這條管線的失敗多半是無聲的
-- 遇到版本衝突時，**優先保 Blackwell 相容性**（CUDA 12.8+ / PyTorch cu128），再去遷就上游 repo 的版本鎖。上游的版本鎖寫於 2024 年，早於 Blackwell 發布
-- 需要查證上游行為時**直接讀原始碼**，不要臆測。兩個 repo 都不大
+```bash
+./tools/open_pointcloud.sh scene04     # Open3D window, dense cloud, click to measure
+./tools/open_gsplat.sh     scene04     # nerfstudio web viewer at localhost:7007
+```
+
+`open_gsplat.sh` picks the most recent training run automatically. **Stop it with Ctrl+C** — closing the browser tab leaves it holding about 2.7 GB of GPU memory.
+
+## Moving a trained scene to another machine
+
+Tested by copying only the files below into an empty directory and loading them with the same `eval_setup(config, test_mode="inference")` call grad_nav uses.
+
+**Four files. The 620 MB of source images are not among them.**
+
+```
+workspace/                                   ← working directory
+├── <scene>/
+│   └── transforms.json                      520 KB
+└── outputs/<scene>/splatfacto/<timestamp>/
+    ├── config.yml                           8 KB
+    ├── dataparser_transforms.json           310 B
+    └── nerfstudio_models/step-*.ckpt        1.8 GB
+```
+
+`sparse_pc.ply` is optional — without it you get an Open3D warning and loading still succeeds. It is small, so bring it anyway.
+
+```bash
+rsync -avP other-host:.../<scene>/transforms.json                        <scene>/
+rsync -avP other-host:.../outputs/<scene>/splatfacto/<timestamp>/  outputs/<scene>/splatfacto/<timestamp>/
+```
+
+**Three things break this:**
+
+1. **Do not rename the timestamp directory.** The checkpoint path is rebuilt from the `timestamp` field inside `config.yml`, not resolved relative to the file's own location.
+2. **Working directory must be the common parent** of `<scene>/` and `outputs/`, because `config.yml` stores relative paths.
+3. **gsplat must be 1.4.0 on both machines.** The checkpoint holds raw parameter tensors.
+
+If you only want to look at the scene, copy the dense `.ply` (26 MB) instead — no checkpoint, no nerfstudio.
 
 ---
 
-## 8. 逐章實作筆記
+## 6. Pitfalls
 
-`notes/` 底下是實際做過的紀錄，含每一步的偏離與理由。遇到問題時比這份 README 更有參考價值：
+### 6.1 ⚠️ The two places intrinsics enter — and why they must agree
 
-| 檔案 | 內容 |
+**This is the failure that cost a full rebuild of scene04.** It produced a 3.37% scale error and no warning of any kind.
+
+Camera intrinsics are consumed at three points in this pipeline:
+
+| Step | Source of intrinsics |
 |---|---|
-| [`notes/00-prechecks.md`](notes/00-prechecks.md) | 動手前的檢查 |
-| [`notes/01-environment.md`](notes/01-environment.md) | 環境安裝的完整紀錄與所有偏離理由 |
-| [`notes/02-code-and-example.md`](notes/02-code-and-example.md) | 跑通官方範例 |
-| [`notes/03-calibration.md`](notes/03-calibration.md) | 相機標定 |
-| [`notes/04-aruco.md`](notes/04-aruco.md) | ArUco 定尺度 |
-| [`notes/05-06-capture-and-gsplat.md`](notes/05-06-capture-and-gsplat.md) | 拍攝與建圖 |
-| [`notes/07-scene-experiments.md`](notes/07-scene-experiments.md) | 場景實驗比較 |
+| SfM (`stage_sfm`) | COLMAP's own self-calibration — `build_gsplat.py` never passes `cfg["camera"]` to it |
+| ArUco solve (`stage_scale`) | `cfg["camera"]`, i.e. your checkerboard calibration |
+| 3DGS training (`stage_train`) | `transforms.json`, i.e. COLMAP's values again |
 
-筆記裡引用的截圖沒有放進 repo（約 21 MB），留在原始機器上。
+Two of three used COLMAP's values; only the scale step used the checkerboard's. Since `solvePnP` returns a distance **proportional to fx**, a focal length 2.32% too large yields a scene 2.32% too large.
+
+| | Checkerboard fx = 1702.28 | COLMAP fx = 1663.73 |
+|---|---|---|
+| ArUco scale consistency | 3.5% | **2.6%** |
+| RANSAC inliers | 9 / 20 | **11 / 20** |
+| Median residual | 0.080 m | **0.044 m** |
+| **Scale error vs tape** | **+3.37% — failed** | **+0.87% — passed** |
+
+Every independent metric improved together — this was not a fit to the one measurement.
+
+**The check to run before trusting a scene:**
+
+```bash
+python - << 'EOF'
+import json
+sfm = json.load(open("repos/SousVide/gsplats/workspace/<scene>/sfm/transforms.json"))
+cfg = json.load(open("repos/SousVide/configs/captures/<config>.json"))["camera"]
+fx_cfg = cfg["intrinsics_matrix"][0][0]
+d = fx_cfg / sfm["fl_x"] - 1
+print(f"config fx {fx_cfg:.2f} vs SfM fl_x {sfm['fl_x']:.2f}  ->  {d*100:+.2f}%")
+print("OK" if abs(d) < 0.01 else "MISMATCH — this becomes your scale error")
+EOF
+```
+
+When they disagree, **prefer COLMAP's**. It is self-calibrated from hundreds of images across the whole scene; a checkerboard video with poor corner coverage is far more weakly constrained, and its low reprojection error will not reveal the problem.
+
+### 6.2 Silent failures to watch for
+
+- **`orientation-method`, `center-method`, `auto-scale-poses`.** Defaults are `up`, `poses`, `True` — **all three destroy metric scale.** They belong to the `nerfstudio-data` dataparser and must appear *after* it on the command line. `build_gsplat.py` already sets them to `none`, `none`, `False`.
+- **Every SfM metric can be green while scale is wrong.** scene02 registered 100% of images at 1.398 px and still had 106.7% ArUco scale dispersion, because the camera walked a straight line. Only an external metric reference catches this.
+- **Laplacian variance is not a blur metric.** It responds to image content too. In scene02 the lowest-scoring frames were perfectly sharp photographs of a blank wall. Only compare within one scene.
+
+### 6.3 grad_nav hardcoded values
+
+grad_nav has several values baked in for the authors' own drone (`carl`). **These must be changed:**
+
+| File | Hardcoded | Change to |
+|---|---|---|
+| `utils/gs_local.py` | `fx=462.956, fy=463.002, cx=323.076, cy=181.184` at 640×360 | These are RealSense D435 values — use your own onboard camera's |
+| `utils/gs_local.py` | three constant matrices in `pose2nerf_transform()` | `T_r2d` is the camera's **mounting extrinsics** (theirs: 15.2 cm forward, 8° down) |
+| `utils/gs_local.py` **and** `envs/*.py` | a `maps` dict in each | **Add your scene to both** |
+| `envs/drone_long_traj.py` | `gs_origin_offset = [-6.0, 0, 0]` | Match your scene's origin |
+| `envs/drone_vla_*.py` | `task_table` | Instruction strings and their waypoints |
+
+Record what you change and why.
+
+### 6.4 Inherent limits of this approach
+
+Not implementation defects — properties of the method:
+
+- **Policies are per-scene.** Zero-shot transfer covers the render-vs-real gap only, not new rooms. A new space means new footage and new training.
+- **Fragile to static scene changes.** SousVide measured a drop from 96% to 25% success when objects present during training were removed; the policy keeps flying through where they used to be. People walking around barely matter.
+- **No collision termination in simulation.** Obstacle avoidance is a soft reward inside 0.5 m. Real hardware does collide — the paper reports 6–7 of 10.
+- **Language instructions are not open-vocabulary.** GRaD-Nav++ covers 4 directions × 3 targets = 12 combinations.
+- **Fails in low light.** Below 40% of original brightness, SousVide's policies drift off course from the start.
+
+---
+
+## Implementation notes
+
+`notes/` holds the record of what was actually done, including every deviation from the upstream instructions and the reasoning. **Written in Traditional Chinese**, and more useful than this README when something breaks.
+
+| File | Topic |
+|---|---|
+| [`notes/00-prechecks.md`](notes/00-prechecks.md) | Pre-flight checks |
+| [`notes/01-environment.md`](notes/01-environment.md) | Environment install, all deviations and why |
+| [`notes/02-code-and-example.md`](notes/02-code-and-example.md) | Running the upstream example first |
+| [`notes/03-calibration.md`](notes/03-calibration.md) | Camera calibration — including why the upstream tool is broken |
+| [`notes/04-aruco.md`](notes/04-aruco.md) | ArUco and metric scale |
+| [`notes/05-06-capture-and-gsplat.md`](notes/05-06-capture-and-gsplat.md) | Capture and mapping |
+| [`notes/07-scene-experiments.md`](notes/07-scene-experiments.md) | Three-scene comparison — why trajectory shape beats image count |
+
+## References
+
+| Paper | Role |
+|---|---|
+| [SousVide](https://arxiv.org/abs/2412.16346) (arXiv 2412.16346) | Source of the mapping method; section III-A is FiGS |
+| [GRaD-Nav++](https://arxiv.org/abs/2506.14009) (RA-L) | The training method |
+| [GRaD-Nav](https://arxiv.org/abs/2503.03984) | Predecessor — differentiable RL and CENet; read before GRaD-Nav++ |
+
+## License
+
+The tools and notes in this repository are the author's own work. The upstream projects carry their own licenses — see [SousVide](https://github.com/StanfordMSL/SousVide) and [grad_nav](https://github.com/Qianzhong-Chen/grad_nav).
