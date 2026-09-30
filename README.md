@@ -54,7 +54,6 @@ The 1.8 GB trained checkpoint is on the [Releases page](../../releases) — too 
 | [`configs/`](configs/) | Camera intrinsics and capture configs |
 | [`scenes/scene04/`](scenes/scene04/) | A complete, scale-verified example scene |
 | [`CLAUDE.md`](CLAUDE.md) | Project goals, constraints, expectation management |
-| [`implement.md`](implement.md) | The original chapter-by-chapter plan (Traditional Chinese) |
 
 **Not in this repo:** the upstream repos, capture videos, extracted images, SfM intermediates, and training checkpoints — about 49 GB in total. All of it is either downloadable or reproducible. Each section below says how.
 

@@ -41,9 +41,9 @@
 
 **CUDA 11.8 最高只支援 sm_90（Hopper），完全不認得 sm_120。** 直接 `conda env create -f environment_x86.yml` 會裝出一個能安裝但跑不動的環境，典型症狀是執行時報 `no kernel image is available for execution on the device`。
 
-必須自建環境：CUDA 12.8+、PyTorch 2.7+（cu128）、gsplat 從源碼編譯。細節見 `implement.md` 第 1 章。
+必須自建環境：CUDA 12.8+、PyTorch 2.7+（cu128）、gsplat 從源碼編譯。細節見 `README.md` 第 1 節「Environment setup」。
 
-**這一點沒有在目標機器上實測過**，是根據 Blackwell 的架構需求推導的。第 1 章附有逐步驗證指令，每一步都要確認通過再往下走。
+**這一點沒有在目標機器上實測過**，是根據 Blackwell 的架構需求推導的。`README.md` 第 3 節「Verify the environment」附有驗證指令，每一步都要確認通過再往下走。
 
 ## 分階段目標與驗收標準
 
@@ -90,7 +90,7 @@ grad_nav 有數處寫死了原作者的硬體與場景，換成自己的環境�
 
 ## 參考資料
 
-三篇論文與程式碼的下載指令寫在 `implement.md` 第 2 章，執行後會落到 `refs/` 與 `repos/`。閱讀優先順序：
+三篇論文的連結在 `README.md` 的「References」一節；程式碼的下載指令在第 2 節「Upstream repositories」，執行後會落到 `repos/`。閱讀優先順序：
 
 1. **SousVide**（arXiv 2412.16346）— 建圖方法的來源，第 III-A 節是 FiGS
 2. **GRaD-Nav++**（arXiv 2506.14009, RA-L）— 訓練方法
