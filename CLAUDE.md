@@ -61,7 +61,6 @@ Do not skip ahead in the implementation order; every stage has a clearly **verif
 
 ## Working rules for the AI assistant
 
-- **Conversations and documents always use Traditional Chinese**; technical terms (3DGS, ArUco, splatfacto, VLA, etc.) stay in English
 - **Scale correctness is the lifeline of this project**. If the 3DGS scene is not metric, the dynamics, the obstacle-avoidance threshold (0.5 m) and the reward are all wrong as a consequence, and **nothing raises an error; it just performs poorly**. Verify every scale-related step on the spot; do not leave it for later
 - **Do not skip verification steps**. Most failures in this pipeline are silent
 - On version conflicts, **prioritize Blackwell compatibility** (CUDA 12.8+ / PyTorch cu128) first, then accommodate the upstream repos' version pins. The upstream pins were written in 2024, before Blackwell was released
