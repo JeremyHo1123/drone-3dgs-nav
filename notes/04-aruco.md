@@ -1,92 +1,92 @@
-# 第 4 章 ArUco tag
+# Chapter 4: ArUco tag
 
-日期：2026-08-13
-產出：`captures/aruco_id0_A4_157mm.pdf`、`captures/aruco_id0_A3_222mm.pdf`
+Date: 2026-08-13
+Outputs: `captures/aruco_id0_A4_157mm.pdf`, `captures/aruco_id0_A3_222mm.pdf`
       `repos/SousVide/configs/captures/iphone12.json`
 
-## FiGS 的硬性要求（已讀原始碼確認）
+## FiGS hard requirements (confirmed by reading the source)
 
-`capture_generation.py`：
+`capture_generation.py`:
 
-| 項目 | 值 | 可否更改 |
+| Item | Value | Changeable? |
 |---|---|---|
-| 字典 | `DICT_4X4_50`（第 166、234 行） | **寫死，不可改** |
-| `marker_id` | 來自 `extractor_config["marker_id"]` | **可改**（手冊說寫死是不準確的） |
-| `marker_length` | 來自 config，用於 `marker_points = ±L/2` | 必填 |
-| 每幀 marker 數 | `len(ids) == 1`（第 262 行） | 硬性，多一個該幀就作廢 |
+| Dictionary | `DICT_4X4_50` (lines 166, 234) | **Hard-coded, cannot change** |
+| `marker_id` | From `extractor_config["marker_id"]` | **Changeable** (the manual's claim that it is hard-coded is inaccurate) |
+| `marker_length` | From config, used for `marker_points = ±L/2` | Required |
+| Markers per frame | `len(ids) == 1` (line 262) | Hard rule; one extra marker and the frame is discarded |
 | PnP | `cv2.SOLVEPNP_IPPE_SQUARE` | — |
 
-`cv2.aruco` 回傳的是黑色方塊**外緣**角點 →
-**`marker_length` = 最外圈黑邊的外緣到外緣，不含白色留白。**
+`cv2.aruco` returns the corners of the **outer edge** of the black square ->
+**`marker_length` = outer edge to outer edge of the outermost black border, excluding the white margin.**
 
-## 尺寸上限的推導
+## Deriving the maximum size
 
-DICT_4X4 的圖案是 6x6 模組（4x4 資料 + 1 模組黑邊）。
-偵測器需要黑框四周有白色留白，慣例至少 1 個模組寬：
+The DICT_4X4 pattern is 6x6 modules (4x4 data + a 1-module black border).
+The detector needs a white margin around the black frame, by convention at least 1 module wide:
 
 ```
-(頁寬 - S)/2 >= S/6   →   S <= 頁寬 * 3/4
+(page_width - S)/2 >= S/6   ->   S <= page_width * 3/4
 A4 (210mm) -> 157mm      A3 (297mm) -> 222mm
 ```
 
-原作用 34.1 cm、手冊建議 >= 25 cm，**單張紙做不到**。
-⚠ 不要用多張 A4 拼貼——接縫錯位與不平整會直接汙染 solvePnP 的姿態解。
-要更大請送影印店印 A2 以上（`make_aruco.py --page 420 594`）。
+The original authors used 34.1 cm and the manual recommends >= 25 cm; **a single sheet of paper cannot do that**.
+⚠ Do not tile several A4 sheets: misaligned seams and unevenness directly contaminate the solvePnP pose solution.
+For anything larger, have a print shop print A2 or bigger (`make_aruco.py --page 420 594`).
 
-產生後的自我驗證（渲染 PDF 再實跑偵測）：
-兩種尺寸都是「剛好 1 個 marker、id=0、量得邊長與標稱差 0.01%」。
+Self-verification after generation (render the PDF, then actually run detection):
+both sizes give "exactly 1 marker, id=0, measured side length within 0.01% of nominal".
 
-## 實測結果
+## Measured results
 
-**列印後實測黑框邊長：長寬皆 14.4 cm → `marker_length = 0.144`**
+**Measured black-frame side length after printing: 14.4 cm in both width and height -> `marker_length = 0.144`**
 
-144 / 157 = **91.7%**。與第 3 章棋盤格的 22/24 = 91.7% **完全一致**。
-兩份不同檔案、不同標稱尺寸卻是同一縮放比，可推論：
+144 / 157 = **91.7%**. **Exactly the same** as the Chapter 3 checkerboard ratio 22/24 = 91.7%.
+Two different files with different nominal sizes but the same scale factor, so we can infer:
 
-1. 印表機套用「縮小以符合可列印範圍」，固定縮到約 91.7%
-2. **且為等比縮放**——這正是最需要排除的風險（非等比會讓 fx/fy 出現假差異）
+1. The printer applies "shrink to fit printable area", a fixed reduction to about 91.7%
+2. **And the scaling is uniform**: this is exactly the risk we most needed to rule out (non-uniform scaling would create a spurious fx/fy difference)
 
-長寬相等亦佐證等比。紙上白邊變多是整頁等比縮小的結果，
-對偵測反而有利（白邊即 quiet zone）。
+Equal width and height also support uniform scaling. The larger white border on the paper is a result of shrinking the whole page uniformly,
+which actually helps detection (the white border is the quiet zone).
 
-## 尺度誤差預算（marker_length = 0.144）
+## Scale error budget (marker_length = 0.144)
 
-| 來源 | 貢獻 |
+| Source | Contribution |
 |---|---|
-| marker_length 量測 ±0.5 mm | 0.35% |
-| 第 3 章 fx 不確定性 | 0.30% |
-| PnP 姿態噪聲（1 m、245 px、20 幀 RANSAC） | 0.046% |
-| **合計** | **0.46%** |
+| marker_length measurement ±0.5 mm | 0.35% |
+| Chapter 3 fx uncertainty | 0.30% |
+| PnP pose noise (1 m, 245 px, 20 frames RANSAC) | 0.046% |
+| **Total** | **0.46%** |
 
-第 7 章驗收標準 < 2%，餘裕 1.54 個百分點。
+The Chapter 7 acceptance criterion is < 2%, leaving a margin of 1.54 percentage points.
 
-⚠ A4 的真正代價不是解析度，是**量測精度要求變嚴格**：
-量測誤差 1:1 轉成尺度誤差，而分母是 marker 邊長。
-同樣量到 ±1 mm，144 mm 的誤差（0.69%）是原作 341 mm（0.29%）的 2.4 倍。
+⚠ The real cost of A4 is not resolution but **a stricter measurement accuracy requirement**:
+measurement error converts 1:1 into scale error, and the denominator is the marker side length.
+For the same ±1 mm measurement, the error for 144 mm (0.69%) is 2.4 times that of the original authors' 341 mm (0.29%).
 
-marker 在畫面上的跨距（fx=1702）：
-0.5 m → 490 px、1.0 m → 245 px、1.5 m → 163 px、2.0 m → 123 px。
-ArUco 姿態解在 100 px 以上相當可靠 → **第 5 章拍 tag 時距離 0.5~1.5 m**。
+Marker span in the image (fx=1702):
+0.5 m -> 490 px, 1.0 m -> 245 px, 1.5 m -> 163 px, 2.0 m -> 123 px.
+ArUco pose solutions are quite reliable above 100 px -> **when filming the tag in Chapter 5, keep a distance of 0.5-1.5 m**.
 
 ## capture config
 
 `repos/SousVide/configs/captures/iphone12.json`
 
 ```
-camera    : 1080x1920 (WxH)  fx=1702.28 fy=1708.64 cx=544.82 cy=949.09  畸變 4 係數
+camera    : 1080x1920 (WxH)  fx=1702.28 fy=1708.64 cx=544.82 cy=949.09  distortion: 4 coefficients
 extractor : num_images=300 num_marked=20 marker_id=0 marker_length=0.144
 ```
 
-驗證方式：完全照抄 `extract_positions()` 的程式碼路徑載入此 config，
-以已知距離投影 marker 角點再 `solvePnP(..., SOLVEPNP_IPPE_SQUARE)` 解回距離。
-0.5 / 1.0 / 1.5 / 2.0 m，各含 0° 與 25° 傾角，**誤差皆 0.0000%**
-→ config 格式、陣列形狀、marker_length 慣例都正確。
-（此驗證只涵蓋數值管線，不含實拍的角點定位噪聲。）
+Verification method: load this config following exactly the code path of `extract_positions()`,
+project the marker corners at known distances, then solve the distance back with `solvePnP(..., SOLVEPNP_IPPE_SQUARE)`.
+0.5 / 1.0 / 1.5 / 2.0 m, each with 0° and 25° tilt: **error is 0.0000% in every case**
+-> the config format, array shapes and marker_length convention are all correct.
+(This verification covers only the numerical pipeline, not corner localization noise in real footage.)
 
-## 擺放要求（第 5 章拍攝時）
+## Placement requirements (when filming in Chapter 5)
 
-- **平放地面**：重建出的世界座標 z 軸即重力反方向，飛行必要
-- **完全平整**，貼硬板或用膠帶壓平；皺摺會讓姿態解歪掉
-- 場地內**不可有第二張 ArUco**
-- ⚠ 注意**鏡子、玻璃、光亮地板的反射**——反射的 tag 會被偵測成第二個 marker，
-  觸發 `len(ids) == 1` 失敗，該幀作廢。這點最容易忽略
+- **Lay it flat on the floor**: the z axis of the reconstructed world frame is then opposite to gravity, which flight requires
+- **Perfectly flat**: mount it on a rigid board or tape it down; wrinkles skew the pose solution
+- **No second ArUco** anywhere in the scene
+- ⚠ Watch out for **reflections in mirrors, glass and glossy floors**: a reflected tag is detected as a second marker,
+  triggering the `len(ids) == 1` failure and discarding the frame. This is the easiest one to overlook

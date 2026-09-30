@@ -1,16 +1,16 @@
 """
-產生可直接列印的棋盤格（9x6 內角點 = 10x7 方格），A4。
+Generate a print-ready checkerboard (9x6 inner corners = 10x7 squares), A4.
 
-輸出兩種格式：
-  - PDF：頁面尺寸即實體 A4，列印無歧義。**建議用這個列印。**
-  - PNG：給程式自我檢查用（cv2 不寫 DPI 中繼資料，列印時檢視器只能猜尺寸）
+Two output formats:
+  - PDF: the page size is a physical A4, so printing is unambiguous. **Use this one for printing (recommended).**
+  - PNG: for the script's self-check (cv2 writes no DPI metadata, so a viewer can only guess the size when printing)
 
-關於列印縮放：
-  標定用的棋盤格**不需要精確的列印比例**。實測驗證過 square_size 不影響
-  標定出的內參與畸變係數（縮放物點只會等比縮放外參的平移向量）。
-  唯一會壞事的是「非等比縮放」——方格變成長方形會讓 fx/fy 出現假差異。
-  因此紙上印了兩條標稱 100 mm 的標尺線（一橫一直）：
-  兩條量起來一樣長就代表等比，不必剛好是 100 mm。
+About print scaling:
+  A calibration checkerboard **does not need an exact print scale**. Tests verified that square_size does not affect
+  the calibrated intrinsics or distortion coefficients (scaling the object points only scales the translation vectors of the extrinsics proportionally).
+  The only thing that breaks it is "non-uniform scaling" -- squares turning into rectangles create a fake fx/fy difference.
+  So the paper carries two scale lines with a nominal 100 mm length (one horizontal, one vertical):
+  if both measure the same length the scaling is uniform; they do not have to be exactly 100 mm.
 """
 import numpy as np
 import cv2
@@ -21,27 +21,27 @@ from matplotlib.patches import Rectangle
 from pathlib import Path
 
 MM_PER_INCH = 25.4
-SQUARE_MM = 24.0                    # 見下方 SAFE_MM 的說明
-INNER_CORNERS = (9, 6)              # (cols, rows) 給 cv2.findChessboardCorners
-SQ_COLS = INNER_CORNERS[0] + 1      # 10 格（長邊）
-SQ_ROWS = INNER_CORNERS[1] + 1      # 7 格（短邊）
+SQUARE_MM = 24.0                    # see the SAFE_MM note below
+INNER_CORNERS = (9, 6)              # (cols, rows) for cv2.findChessboardCorners
+SQ_COLS = INNER_CORNERS[0] + 1      # 10 squares (long side)
+SQ_ROWS = INNER_CORNERS[1] + 1      # 7 squares (short side)
 A4_W_MM, A4_H_MM = 210.0, 297.0
 
-# 一般雷射/噴墨印表機的不可列印邊界約 4~5 mm，留 12 mm 才安全。
-# 方格 25 mm 時棋盤高 250 mm，扣掉安全邊界後放不下標註文字，
-# 會被裁切或觸發印表機的「縮小以符合可列印範圍」。改為 24 mm，
-# 棋盤 168 x 240 mm，上下左右都留得下標註。
-# （方格尺寸不影響標定結果，縮小沒有代價。）
+# Typical laser/inkjet printers have a 4~5 mm non-printable margin; 12 mm is safe.
+# With 25 mm squares the board is 250 mm tall, and after the safe margins there is no room for the labels,
+# which get clipped or trigger the printer's "shrink to fit printable area". Changed to 24 mm:
+# the board is 168 x 240 mm, leaving room for labels on every side.
+# (The square size does not affect the calibration result, so shrinking costs nothing.)
 SAFE_MM = 12.0
 
 out_dir = Path(__file__).resolve().parent.parent / "captures"
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------- PDF（列印用）
+# ---------------------------------------------------------------- PDF (for printing)
 board_w = SQ_ROWS * SQUARE_MM        # 175 mm
 board_h = SQ_COLS * SQUARE_MM        # 250 mm
-ox = (A4_W_MM - board_w) / 2 - 3     # 略偏左，右側留給縱向標註
-oy = (A4_H_MM - board_h) / 2         # 上下留白平均分配給標註文字
+ox = (A4_W_MM - board_w) / 2 - 3     # slightly left of center; the right side is for the vertical label
+oy = (A4_H_MM - board_h) / 2         # top and bottom margins split evenly for the label text
 
 fig = plt.figure(figsize=(A4_W_MM / MM_PER_INCH, A4_H_MM / MM_PER_INCH))
 ax = fig.add_axes([0, 0, 1, 1])
@@ -53,14 +53,14 @@ ax.axis("off")
 for r in range(SQ_COLS):
     for c in range(SQ_ROWS):
         if (r + c) % 2 == 0:
-            continue                  # 只畫黑格
+            continue                  # draw black squares only
         ax.add_patch(Rectangle(
             (ox + c * SQUARE_MM, oy + r * SQUARE_MM),
             SQUARE_MM, SQUARE_MM,
             facecolor="black", edgecolor="none"))
 
-# 等比檢查改用「棋盤本身的跨距」——比量單一方格精準得多
-# （量 24 mm 的一格，尺的 0.5 mm 誤差就是 2%；量 240 mm 的跨距只有 0.2%）。
+# The uniform-scale check uses "the span of the board itself" -- far more precise than measuring one square
+# (on a 24 mm square a 0.5 mm ruler error is 2%; on the 240 mm span it is only 0.2%).
 ax.annotate("", xy=(ox, oy - 6), xytext=(ox + board_w, oy - 6),
             arrowprops=dict(arrowstyle="<->", lw=1.0, color="black"))
 ax.text(ox + board_w / 2, oy - 9,
@@ -73,7 +73,7 @@ ax.text(ox + board_w + 9, oy + board_h / 2,
         f"H = {SQ_COLS} squares = {board_h:.0f} mm nominal",
         ha="left", va="center", fontsize=8, rotation=90)
 
-# 三行說明由下往上排，最下面一行距棋盤上緣 1.5 mm，不可壓到板子
+# Three lines of text stacked bottom-up; the lowest line is 1.5 mm above the board's top edge and must not overlap the board
 ax.text(ox, oy + board_h + 1.5,
         f"CHECK: measured H / W must be {board_h / board_w:.3f} "
         f"(= {board_h:.0f}/{board_w:.0f}). Mount FLAT on rigid board.",
@@ -90,7 +90,7 @@ pdf = out_dir / "checkerboard_9x6_A4.pdf"
 fig.savefig(pdf, format="pdf")
 plt.close(fig)
 
-# ---------------------------------------------------------------- PNG（自我檢查用）
+# ---------------------------------------------------------------- PNG (for the self-check)
 DPI = 300
 sq_px = SQUARE_MM / MM_PER_INCH * DPI
 bw, bh = int(round(SQ_ROWS * sq_px)), int(round(SQ_COLS * sq_px))
@@ -105,15 +105,15 @@ png_img = cv2.copyMakeBorder(board, pad, pad, pad, pad, cv2.BORDER_CONSTANT, val
 png = out_dir / "checkerboard_9x6_A4.png"
 cv2.imwrite(str(png), png_img)
 
-# ---------------------------------------------------------------- 自我檢查
+# ---------------------------------------------------------------- self-check
 ok, corners = cv2.findChessboardCorners(png_img, INNER_CORNERS, None)
 n = 0 if corners is None else len(corners)
 
-print(f"已產生:")
-print(f"  {pdf}   ← 列印用")
-print(f"  {png}   ← 程式自我檢查用")
-print(f"  棋盤 {SQ_ROWS}x{SQ_COLS} 方格 = {board_w:.0f} x {board_h:.0f} mm，內角點 {INNER_CORNERS[0]}x{INNER_CORNERS[1]}")
-print(f"  A4 頁面 {A4_W_MM:.0f} x {A4_H_MM:.0f} mm")
+print(f"Generated:")
+print(f"  {pdf}   <- for printing")
+print(f"  {png}   <- for the script's self-check")
+print(f"  Board {SQ_ROWS}x{SQ_COLS} squares = {board_w:.0f} x {board_h:.0f} mm, inner corners {INNER_CORNERS[0]}x{INNER_CORNERS[1]}")
+print(f"  A4 page {A4_W_MM:.0f} x {A4_H_MM:.0f} mm")
 print()
-print(f"  cv2.findChessboardCorners 自我檢查: {'通過' if ok else '**失敗**'}"
-      f"（偵測到 {n} 個角點，應為 {INNER_CORNERS[0] * INNER_CORNERS[1]}）")
+print(f"  cv2.findChessboardCorners self-check: {'PASSED' if ok else '**FAILED**'}"
+      f" (detected {n} corners, expected {INNER_CORNERS[0] * INNER_CORNERS[1]})")

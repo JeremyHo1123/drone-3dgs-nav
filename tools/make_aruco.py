@@ -1,26 +1,26 @@
 """
-產生 FiGS 定尺度用的 ArUco tag PDF。
+Generate the ArUco tag PDF used by the FiGS scale solve.
 
-FiGS 的硬性要求（已讀原始碼確認，capture_generation.py:166/234）：
-  - 字典必須是 DICT_4X4_50（寫死，不可改）
-  - marker_id 由 config 的 extractor_config["marker_id"] 指定（預設 0）
-  - solvePnP 的 marker_points 是 ±marker_length/2，而 cv2.aruco 回傳的是
-    黑色方塊「外緣」角點 → marker_length 就是黑色方塊的整個邊長
-    （含最外圈黑邊，不含白色留白）
+Hard requirements of FiGS (confirmed by reading the source, capture_generation.py:166/234):
+  - The dictionary must be DICT_4X4_50 (hard-coded, cannot be changed)
+  - marker_id is set by the config's extractor_config["marker_id"] (default 0)
+  - solvePnP's marker_points are +/-marker_length/2, and cv2.aruco returns the
+    corners of the black square's OUTER edge -> marker_length is the full side length of the black square
+    (including the outermost black border, excluding the white quiet zone)
 
-尺寸選擇：
-  DICT_4X4 的圖案是 6x6 個模組（4x4 資料 + 最外圈 1 模組黑邊）。
-  偵測器需要黑色方塊四周有白色留白，慣例是至少 1 個模組寬。
-  因此邊長 S 需滿足 (頁寬 - S)/2 >= S/6，即 S <= 頁寬 * 3/4。
+Choosing the size:
+  A DICT_4X4 pattern is 6x6 modules (4x4 data + a 1-module black border).
+  The detector needs a white quiet zone around the black square, by convention at least 1 module wide.
+  So the side length S must satisfy (page width - S)/2 >= S/6, i.e. S <= page width * 3/4.
     A4 (210mm) -> S <= 157.5mm
     A3 (297mm) -> S <= 222.8mm
-  原作用 34.1 cm，手冊建議至少 25 cm；單張 A4/A3 達不到，
-  要更大需送影印店印 A2 以上（本工具用 --page 可指定任意尺寸）。
-  ⚠ 不建議用多張 A4 拼貼——接縫的錯位與不平整會直接汙染 solvePnP 的姿態解。
+  The original authors used 34.1 cm and the manual recommends at least 25 cm; a single A4/A3 sheet cannot reach that,
+  so for larger tags have a print shop print A2 or bigger (this tool accepts any size via --page).
+  ⚠ Tiling several A4 sheets is not recommended -- misalignment and unevenness at the seams directly corrupt the solvePnP pose solution.
 
-用法:
-  python make_aruco.py                 # 同時產生 A4 與 A3
-  python make_aruco.py --page 420 594  # 自訂頁面 (寬 高, mm)，例如 A2
+Usage:
+  python make_aruco.py                 # generate both A4 and A3
+  python make_aruco.py --page 420 594  # custom page (width height, mm), e.g. A2
 """
 import argparse
 from pathlib import Path
@@ -34,24 +34,24 @@ from matplotlib.patches import Rectangle
 
 MM_PER_INCH = 25.4
 MARKER_ID = 0
-MODULES = 6          # DICT_4X4 = 4x4 資料 + 1 模組黑邊 => 6x6
-SAFE_MM = 10.0       # 印表機不可列印邊界的安全值
+MODULES = 6          # DICT_4X4 = 4x4 data + 1-module black border => 6x6
+SAFE_MM = 10.0       # safe value for the printer's non-printable margin
 
 PAGES = {"A4": (210.0, 297.0), "A3": (297.0, 420.0)}
 
 
 def build_pdf(page_name, page_w, page_h, out_dir: Path):
-    # 取 6x6 的模組點陣，一個像素就是一個模組，避免重採樣造成的幾何誤差
+    # Take the 6x6 module bitmap, one pixel per module, to avoid geometric error from resampling
     d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     bits = cv2.aruco.generateImageMarker(d, MARKER_ID, MODULES)   # 6x6, 0/255
 
-    # 白邊 >= 1 模組，且 >= 安全邊界
+    # White margin >= 1 module, and >= the safe margin
     s_by_quiet = page_w * MODULES / (MODULES + 2)     # (page_w - S)/2 >= S/6
     s_by_safe = page_w - 2 * SAFE_MM
-    S = np.floor(min(s_by_quiet, s_by_safe))          # 取整數 mm
+    S = np.floor(min(s_by_quiet, s_by_safe))          # round down to whole mm
     mod = S / MODULES
     ox = (page_w - S) / 2
-    oy = (page_h - S) / 2 + 8                          # 略上移，下方放說明
+    oy = (page_h - S) / 2 + 8                          # shifted up slightly; the notes go below
 
     fig = plt.figure(figsize=(page_w / MM_PER_INCH, page_h / MM_PER_INCH))
     ax = fig.add_axes([0, 0, 1, 1])
@@ -60,12 +60,12 @@ def build_pdf(page_name, page_w, page_h, out_dir: Path):
 
     for r in range(MODULES):
         for c in range(MODULES):
-            if bits[r, c] == 0:                        # 黑模組
+            if bits[r, c] == 0:                        # black module
                 ax.add_patch(Rectangle(
                     (ox + c * mod, oy + (MODULES - 1 - r) * mod),
                     mod, mod, facecolor="black", edgecolor="none"))
 
-    # 標示「要量的就是這一段」——對齊黑色方塊外緣
+    # Mark "this is the segment to measure" -- aligned with the black square's outer edge
     ay = oy - 7
     ax.annotate("", xy=(ox, ay), xytext=(ox + S, ay),
                 arrowprops=dict(arrowstyle="<->", lw=1.1, color="black"))
@@ -94,7 +94,7 @@ def build_pdf(page_name, page_w, page_h, out_dir: Path):
 
 
 def verify(pdf: Path, S_nominal: float):
-    """渲染 PDF 後實際跑一次偵測，並量出黑色方塊邊長。"""
+    """Render the PDF, actually run detection once, and measure the black square's side length."""
     import subprocess, tempfile, glob, os
     with tempfile.TemporaryDirectory() as td:
         subprocess.run(["pdftoppm", "-png", "-r", "300", str(pdf),
@@ -108,23 +108,23 @@ def verify(pdf: Path, S_nominal: float):
 
     n = 0 if ids is None else len(ids)
     ok = (n == 1 and int(ids[0][0]) == MARKER_ID)
-    msg = f"偵測到 {n} 個 marker"
+    msg = f"detected {n} marker(s)"
     if n >= 1:
-        msg += f"，id={[int(i) for i in ids.ravel()]}"
+        msg += f", id={[int(i) for i in ids.ravel()]}"
     if ok:
         p = corners[0].reshape(4, 2)
         sides = [np.linalg.norm(p[i] - p[(i + 1) % 4]) for i in range(4)]
         mm = 25.4 / 300
         meas = np.mean(sides) * mm
-        msg += f"，量得黑框邊長 {meas:.2f} mm（標稱 {S_nominal:.0f}，"
-        msg += f"偏差 {abs(meas - S_nominal) / S_nominal * 100:.2f}%）"
+        msg += f", measured black square side {meas:.2f} mm (nominal {S_nominal:.0f}, "
+        msg += f"deviation {abs(meas - S_nominal) / S_nominal * 100:.2f}%)"
     return ok, msg
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", nargs=2, type=float, metavar=("W_MM", "H_MM"),
-                    help="自訂頁面尺寸(mm)，不給則產生 A4 與 A3")
+                    help="custom page size (mm); if omitted, generate A4 and A3")
     ap.add_argument("--out-dir", type=Path,
                     default=Path(__file__).resolve().parent.parent / "captures")
     args = ap.parse_args()
@@ -138,9 +138,9 @@ def main():
         ok, msg = verify(pdf, S)
         print(f"{name} ({w:.0f}x{h:.0f} mm)")
         print(f"  {pdf.name}")
-        print(f"  黑色方塊標稱邊長 {S:.0f} mm，白邊 {(w - S) / 2:.1f} mm "
-              f"（= {(w - S) / 2 / (S / MODULES):.2f} 個模組，需 >= 1）")
-        print(f"  驗證: {'通過' if ok else '**失敗**'} — {msg}")
+        print(f"  Black square nominal side {S:.0f} mm, white margin {(w - S) / 2:.1f} mm "
+              f"(= {(w - S) / 2 / (S / MODULES):.2f} modules, need >= 1)")
+        print(f"  Verification: {'PASSED' if ok else '**FAILED**'} - {msg}")
         print()
 
 

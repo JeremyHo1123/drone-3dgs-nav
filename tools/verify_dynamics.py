@@ -1,26 +1,26 @@
 """
-驗證 grad_nav 的四旋翼動力學參數。
+Verify grad_nav's quadrotor dynamics parameters.
 
-動力學參數填錯不會報錯，只會安靜地訓練出飛不起來的策略。
-本工具在不跑訓練的前提下，直接對 QuadrotorSimulator 做三個測試。
+Wrong dynamics parameters raise no error; they just silently train a policy that cannot fly.
+Without running any training, this tool runs three tests directly on QuadrotorSimulator.
 
-它做兩件事：
-  1. 換算報告——把你填的參數換算成有物理意義的量（推重比、懸停油門、
-     角速度時間常數、馬達時間常數），並標出超出合理範圍的項目。
-  2. 三個數值測試——懸停、滿油門爬升、角速度階躍，逐項 PASS/FAIL。
+It does two things:
+  1. Derived report: converts your parameters into physically meaningful quantities (thrust-to-weight ratio, hover throttle,
+     angular-rate time constant, motor time constant) and flags anything outside a reasonable range.
+  2. Three numerical tests: hover, full-throttle climb, angular-rate step, each reported as PASS/FAIL.
 
-兩個上游程式碼的陷阱，本工具已經處理：
-  - thrust 指令經過 (clip(a,-1,1)+1)*0.25 縮放，範圍是 [0, 0.5]。
-    所以實際最大總推力 = 0.5 * max_thrust 參數，只有你填的一半。
-  - rotor_noise_std=None 會讓 QuadrotorSimulator.update() 拋 NameError
-    （第 119-121 行的 if 沒有 else 分支），要關噪聲得傳 0.0。
+Two pitfalls in the upstream code, already handled by this tool:
+  - The thrust command is scaled by (clip(a,-1,1)+1)*0.25, so its range is [0, 0.5].
+    Therefore the actual maximum total thrust = 0.5 * the max_thrust parameter, only half of what you enter.
+  - rotor_noise_std=None makes QuadrotorSimulator.update() raise NameError
+    (the if on lines 119-121 has no else branch); to disable noise pass 0.0.
 
-用法:
-  python tools/verify_dynamics.py                         # 用原作 carl 的參數
+Usage:
+  python tools/verify_dynamics.py                         # use the original carl parameters
   python tools/verify_dynamics.py --mass 0.7 --motor-thrust-g 700 \
-      --arm-radius 0.11                                   # 只給機體規格，其餘自動推算
+      --arm-radius 0.11                                   # airframe specs only, the rest is derived
   python tools/verify_dynamics.py --mass 0.7 --max-thrust 55.0 \
-      --inertia 0.0034 0.0034 0.0076 --kp 0.31 0.31 0.69  # 完全手動指定
+      --inertia 0.0034 0.0034 0.0076 --kp 0.31 0.31 0.69  # fully manual
 """
 import argparse
 import importlib.util
@@ -31,18 +31,18 @@ import warnings
 
 import torch
 
-# 上游 quadrotor_dynamics_advanced.py:132 用了沒指定 dim 的 torch.cross，
-# 每步都會噴一次 deprecation warning。這是上游的事，這裡濾掉以免蓋住結果。
+# Upstream quadrotor_dynamics_advanced.py:132 calls torch.cross without specifying dim,
+# which emits a deprecation warning every step. That is upstream's problem; filter it here so it does not bury the results.
 warnings.filterwarnings("ignore", message=".*torch.cross without specifying.*")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DYN_PATH = (PROJECT_ROOT
             / "repos/grad_nav/envs/assets/quadrotor_dynamics_advanced.py")
 
-# 直接依檔案路徑載入。不能走 `from envs.assets...` 匯入，因為
-# repos/grad_nav/envs/__init__.py 會連帶匯入全部環境檔，而 drone_long_traj.py
-# 依賴已從 torchvision 移除的 torchvision.io.write_video，會在此炸掉。
-# 動力學模組本身只依賴 torch，單獨載入沒有問題。
+# Load directly by file path. Importing via `from envs.assets...` does not work, because
+# repos/grad_nav/envs/__init__.py also imports every environment file, and drone_long_traj.py
+# depends on torchvision.io.write_video, which has been removed from torchvision, so it blows up there.
+# The dynamics module itself only depends on torch, so loading it alone is fine.
 _spec = importlib.util.spec_from_file_location("quadrotor_dynamics", DYN_PATH)
 _dyn = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_dyn)
@@ -50,8 +50,8 @@ QuadrotorSimulator = _dyn.QuadrotorSimulator
 
 G = 9.81
 
-# 原作者那台無人機（代號 carl）的參數，出處：
-#   envs/drone_vla_multi_map.py:93-104、envs/drone_long_traj.py:77-90
+# Parameters of the original authors' drone (codename carl), from:
+#   envs/drone_vla_multi_map.py:93-104, envs/drone_long_traj.py:77-90
 CARL = dict(
     mass=1.1,                             # min_mass 1.0 + 0.5 * mass_range 0.2
     max_thrust=26.0,                      # min_thrust 24.0 + 0.5 * thrust_range 4.0
@@ -60,105 +60,105 @@ CARL = dict(
     kd=[0.001, 0.001, 0.002],
     br_delay=0.8,
     thrust_delay=0.7,
-    br_limit=0.5,                         # rad/s，envs/drone_long_traj.py:84
-    drag_coeff=0.5,                       # QuadrotorSimulator 預設值，env 從未傳入
+    br_limit=0.5,                         # rad/s, envs/drone_long_traj.py:84
+    drag_coeff=0.5,                       # QuadrotorSimulator default; the env never passes it
     cross_area=0.1,
     freq=200.0,
     dt=0.05,
 )
 
-# 上游把 thrust 指令壓進 [0, 0.5]，見 drone_vla_multi_map.py:555
+# Upstream squashes the thrust command into [0, 0.5], see drone_vla_multi_map.py:555
 THRUST_CMD_MAX = 0.5
 
 
 def build_args():
     p = argparse.ArgumentParser(
-        description="驗證 grad_nav 四旋翼動力學參數",
+        description="Verify grad_nav quadrotor dynamics parameters",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--mass", type=float, default=CARL["mass"],
-                   help="總質量（含電池），kg")
+                   help="Total mass (including battery), kg")
     p.add_argument("--max-thrust", type=float, default=None,
-                   help="填進 QuadrotorSimulator 的 max_thrust 參數（N）。"
-                        "= 2 x 四顆馬達滿油門總推力。與 --motor-thrust-g 二選一")
+                   help="The max_thrust parameter passed to QuadrotorSimulator (N). "
+                        "= 2 x total full-throttle thrust of the four motors. Mutually exclusive with --motor-thrust-g")
     p.add_argument("--motor-thrust-g", type=float, default=None,
-                   help="單顆馬達滿油門推力，公克。會自動換算成 max_thrust 參數")
+                   help="Full-throttle thrust of one motor, grams. Converted to the max_thrust parameter automatically")
     p.add_argument("--num-motors", type=int, default=4)
     p.add_argument("--arm-radius", type=float, default=None,
-                   help="機體中心到馬達的距離，公尺（對角軸距的一半）。"
-                        "給了就用經驗公式估慣量")
+                   help="Distance from the airframe center to a motor, meters (half the diagonal wheelbase). "
+                        "If given, inertia is estimated with an empirical formula")
     p.add_argument("--inertia", type=float, nargs=3, default=None,
-                   metavar=("IX", "IY", "IZ"), help="三軸慣量，kg*m^2")
+                   metavar=("IX", "IY", "IZ"), help="Inertia about the three axes, kg*m^2")
     p.add_argument("--kp", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
     p.add_argument("--kd", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
     p.add_argument("--tau-rate", type=float, default=0.011,
-                   help="想要的角速度反應時間常數，秒。沒給 --kp 時用它推算 Kp")
+                   help="Desired angular-rate response time constant, seconds. Used to derive Kp when --kp is not given")
     p.add_argument("--br-delay", type=float, default=CARL["br_delay"])
     p.add_argument("--thrust-delay", type=float, default=CARL["thrust_delay"])
     p.add_argument("--br-limit", type=float, default=CARL["br_limit"],
-                   help="policy 能要求的最大角速度，rad/s")
+                   help="Maximum angular rate the policy can command, rad/s")
     p.add_argument("--drag-coeff", type=float, default=CARL["drag_coeff"])
     p.add_argument("--cross-area", type=float, default=CARL["cross_area"])
-    p.add_argument("--freq", type=float, default=CARL["freq"], help="內圈積分頻率，Hz")
-    p.add_argument("--dt", type=float, default=CARL["dt"], help="外圈 policy 決策週期，秒")
-    p.add_argument("--cpu", action="store_true", help="強制在 CPU 上跑")
+    p.add_argument("--freq", type=float, default=CARL["freq"], help="Inner-loop integration frequency, Hz")
+    p.add_argument("--dt", type=float, default=CARL["dt"], help="Outer-loop policy decision period, seconds")
+    p.add_argument("--cpu", action="store_true", help="Force running on CPU")
     return p.parse_args()
 
 
 def resolve(a):
-    """把使用者給的規格補齊成一組完整參數，並回報每個值是怎麼來的。"""
+    """Complete the user-given specs into a full parameter set, and report where each value came from."""
     src = {}
 
     if a.max_thrust is not None and a.motor_thrust_g is not None:
-        sys.exit("錯誤：--max-thrust 與 --motor-thrust-g 只能擇一")
+        sys.exit("Error: --max-thrust and --motor-thrust-g are mutually exclusive")
 
     if a.motor_thrust_g is not None:
         total_n = a.num_motors * a.motor_thrust_g / 1000.0 * G
         a.max_thrust = 2.0 * total_n
-        src["max_thrust"] = (f"由 {a.num_motors} x {a.motor_thrust_g:.0f} g "
-                             f"= {total_n:.2f} N 實際推力，x2 換算而來")
+        src["max_thrust"] = (f"converted from {a.num_motors} x {a.motor_thrust_g:.0f} g "
+                             f"= {total_n:.2f} N actual thrust, x2")
     elif a.max_thrust is None:
         a.max_thrust = CARL["max_thrust"]
-        src["max_thrust"] = "原作 carl 的值"
+        src["max_thrust"] = "original carl value"
     else:
-        src["max_thrust"] = "手動指定"
+        src["max_thrust"] = "manually specified"
 
     if a.inertia is None:
         if a.arm_radius is not None:
-            # 係數出自 X 型四旋翼的逐元件模型：四顆馬達組件在半徑 L 上
-            # （Ix=Iy=2*m_tip*L^2、Iz=4*m_tip*L^2），加機臂（桿繞端點 m*L^2/3）
-            # 與中心質量（迴轉半徑約 0.07-0.08 m）。
-            # 不要改用「從 carl 的 link_length=0.15 反推」的係數——
-            # link_length 是上游宣告但從未使用的參數，不代表真實臂長。
+            # Coefficients come from a per-component model of an X quadrotor: four motor assemblies at radius L
+            # (Ix=Iy=2*m_tip*L^2, Iz=4*m_tip*L^2), plus the arms (rod about its end, m*L^2/3)
+            # and the central mass (radius of gyration about 0.07-0.08 m).
+            # Do not switch to coefficients "back-derived from carl's link_length=0.15":
+            # link_length is a parameter upstream declares but never uses; it is not the real arm length.
             mL2 = a.mass * a.arm_radius ** 2
             a.inertia = [0.17 * mL2, 0.18 * mL2, 0.31 * mL2]
-            src["inertia"] = (f"逐元件模型 Ix=0.17*m*L^2、Iy=0.18*m*L^2、"
-                              f"Iz=0.31*m*L^2，L={a.arm_radius} m")
+            src["inertia"] = (f"per-component model Ix=0.17*m*L^2, Iy=0.18*m*L^2, "
+                              f"Iz=0.31*m*L^2, L={a.arm_radius} m")
         else:
             a.inertia = list(CARL["inertia"])
-            src["inertia"] = "原作 carl 的值（沒給 --arm-radius）"
+            src["inertia"] = "original carl value (no --arm-radius given)"
     else:
-        src["inertia"] = "手動指定"
+        src["inertia"] = "manually specified"
 
     if a.kd is None:
         a.kd = [0.08 * i for i in a.inertia]
-        src["kd"] = "Kd = 0.08 * I（由原作三軸的 Kd/I 比例反推）"
+        src["kd"] = "Kd = 0.08 * I (back-derived from the original per-axis Kd/I ratio)"
     else:
-        src["kd"] = "手動指定"
+        src["kd"] = "manually specified"
 
     if a.kp is None:
         a.kp = [(i + d) / a.tau_rate for i, d in zip(a.inertia, a.kd)]
-        src["kp"] = f"Kp = (I + Kd) / tau，tau = {a.tau_rate} s"
+        src["kp"] = f"Kp = (I + Kd) / tau, tau = {a.tau_rate} s"
     else:
-        src["kp"] = "手動指定"
+        src["kp"] = "manually specified"
 
     return a, src
 
 
 def report_derived(a, src):
-    """把參數換算成有物理意義的量。這一段比數值測試更常抓到錯誤。"""
+    """Convert the parameters into physically meaningful quantities. This section catches errors more often than the numerical tests."""
     print("=" * 68)
-    print("  換算報告")
+    print("  Derived report")
     print("=" * 68)
 
     weight = a.mass * G
@@ -166,67 +166,67 @@ def report_derived(a, src):
     twr = real_max_thrust / weight
     hover_norm = weight / a.max_thrust
 
-    print(f"\n[ 推力 ]  {src['max_thrust']}")
-    print(f"  max_thrust 參數          : {a.max_thrust:.2f} N")
-    print(f"  實際可用最大總推力       : {real_max_thrust:.2f} N   (= 0.5 x 參數)")
-    print(f"  機體重量                 : {weight:.2f} N   ({a.mass} kg)")
-    print(f"  推重比                   : {twr:.2f}")
-    print(f"  懸停時的正規化推力       : {hover_norm:.3f}   (指令上限 {THRUST_CMD_MAX})")
+    print(f"\n[ Thrust ]  {src['max_thrust']}")
+    print(f"  max_thrust parameter       : {a.max_thrust:.2f} N")
+    print(f"  usable max total thrust    : {real_max_thrust:.2f} N   (= 0.5 x parameter)")
+    print(f"  airframe weight            : {weight:.2f} N   ({a.mass} kg)")
+    print(f"  thrust-to-weight ratio     : {twr:.2f}")
+    print(f"  normalized hover thrust    : {hover_norm:.3f}   (command limit {THRUST_CMD_MAX})")
 
     warns = []
     if hover_norm >= THRUST_CMD_MAX:
-        warns.append(f"懸停就已超過指令上限 {THRUST_CMD_MAX}，這台在模擬裡浮不起來。"
-                     f"max_thrust 至少要 {weight / THRUST_CMD_MAX:.1f} N")
+        warns.append(f"Hover alone already exceeds the command limit {THRUST_CMD_MAX}; this airframe cannot get airborne in the sim. "
+                     f"max_thrust must be at least {weight / THRUST_CMD_MAX:.1f} N")
     elif hover_norm > 0.45:
-        warns.append(f"懸停油門 {hover_norm:.3f} 太接近上限 {THRUST_CMD_MAX}，"
-                     f"推重比只有 {twr:.2f}，幾乎沒有爬升餘裕")
+        warns.append(f"Hover throttle {hover_norm:.3f} is too close to the limit {THRUST_CMD_MAX}; "
+                     f"thrust-to-weight ratio is only {twr:.2f}, almost no climb margin")
     if twr > 4.0:
-        warns.append(f"推重比 {twr:.2f} 偏高，懸停油門只有 {hover_norm:.3f}，"
-                     f"policy 的輸出解析度會集中在很小的區間，可能不好訓")
+        warns.append(f"Thrust-to-weight ratio {twr:.2f} is high and hover throttle is only {hover_norm:.3f}; "
+                     f"the policy's output resolution is squeezed into a small interval, which may be hard to train")
 
-    print(f"\n[ 姿態控制 ]  Kp: {src['kp']}   Kd: {src['kd']}")
-    print(f"  {'軸':<8}{'I (kg*m^2)':>13}{'Kd':>12}{'Kp':>10}{'tau (s)':>11}")
+    print(f"\n[ Attitude control ]  Kp: {src['kp']}   Kd: {src['kd']}")
+    print(f"  {'axis':<8}{'I (kg*m^2)':>13}{'Kd':>12}{'Kp':>10}{'tau (s)':>11}")
     for name, i, kp, kd in zip(("roll x", "pitch y", "yaw z"), a.inertia, a.kp, a.kd):
         print(f"  {name:<8}{i:>13.5f}{kd:>12.5f}{kp:>10.3f}{(i + kd) / kp:>11.4f}")
-    print(f"  慣量來源: {src['inertia']}")
+    print(f"  inertia source: {src['inertia']}")
 
     taus = [(i + d) / k for i, d, k in zip(a.inertia, a.kd, a.kp)]
     for name, t in zip(("roll", "pitch", "yaw"), taus):
         if t > a.dt:
-            warns.append(f"{name} 的 tau={t:.4f} s 大於 policy 週期 {a.dt} s，"
-                         f"姿態跟不上指令")
+            warns.append(f"{name} tau={t:.4f} s is larger than the policy period {a.dt} s; "
+                         f"attitude cannot keep up with commands")
         elif t < 2.0 / a.freq:
-            warns.append(f"{name} 的 tau={t:.4f} s 小於 2 個積分步 "
-                         f"({2.0 / a.freq:.4f} s)，Euler 積分會發散")
+            warns.append(f"{name} tau={t:.4f} s is smaller than 2 integration steps "
+                         f"({2.0 / a.freq:.4f} s); Euler integration will diverge")
 
-    print(f"\n[ 指令延遲 ]  （一階低通，tau = -dt / ln(1 - a)）")
-    for label, factor in (("角速度 br_delay_factor", a.br_delay),
-                          ("推力   thrust_delay_factor", a.thrust_delay)):
+    print(f"\n[ Command delay ]  (first-order low-pass, tau = -dt / ln(1 - a))")
+    for label, factor in (("rate   br_delay_factor", a.br_delay),
+                          ("thrust thrust_delay_factor", a.thrust_delay)):
         tau = -a.dt / torch.log(torch.tensor(1.0 - factor)).item()
         print(f"  {label:<28}= {factor:.2f}  ->  tau = {tau:.4f} s")
 
-    print(f"\n[ 其他 ]")
-    print(f"  角速度上限               : ±{a.br_limit:.2f} rad/s "
-          f"(±{a.br_limit * 180 / 3.14159:.1f} 度/秒)")
+    print(f"\n[ Other ]")
+    print(f"  angular rate limit         : ±{a.br_limit:.2f} rad/s "
+          f"(±{a.br_limit * 180 / 3.14159:.1f} deg/s)")
     v_ref = 3.0
     f_drag = 0.5 * a.drag_coeff * a.cross_area * 1.225 * v_ref ** 2
-    print(f"  {v_ref:.0f} m/s 時的空氣阻力  : {f_drag:.3f} N "
-          f"(重量的 {100 * f_drag / weight:.1f}%)")
-    print(f"  每個 policy 步的積分次數 : {int(a.dt * a.freq)}")
+    print(f"  air drag at {v_ref:.0f} m/s          : {f_drag:.3f} N "
+          f"({100 * f_drag / weight:.1f}% of weight)")
+    print(f"  inner steps per policy step: {int(a.dt * a.freq)}")
 
     if warns:
-        print(f"\n[ 警告 ]")
+        print(f"\n[ Warnings ]")
         for w in warns:
             print(f"  ! {w}")
     return warns
 
 
 def make_sim(a):
-    """建一個關掉噪聲的 QuadrotorSimulator。噪聲要傳 0.0 不能傳 None。
+    """Build a QuadrotorSimulator with noise disabled. Noise must be passed as 0.0, not None.
 
-    QuadrotorSimulator.__init__ 把 self.device 寫死成
-    `cuda if torch.cuda.is_available() else cpu`，沒有參數可以覆蓋。
-    要強制走 CPU 只能暫時遮蔽 cuda 偵測。
+    QuadrotorSimulator.__init__ hardcodes self.device as
+    `cuda if torch.cuda.is_available() else cpu`, with no parameter to override it.
+    The only way to force CPU is to temporarily mask CUDA detection.
     """
     n = 1
     if a.cpu:
@@ -243,7 +243,7 @@ def _build(a, n):
     return QuadrotorSimulator(
         mass=torch.full((n,), a.mass),
         inertia=torch.diag(torch.tensor(a.inertia)).unsqueeze(0).repeat(n, 1, 1),
-        link_length=0.15,          # 上游從未使用此參數，填什麼都一樣
+        link_length=0.15,          # never used upstream; any value works
         Kp=torch.tensor(a.kp).unsqueeze(0).repeat(n, 1),
         Kd=torch.tensor(a.kd).unsqueeze(0).repeat(n, 1),
         freq=a.freq,
@@ -259,20 +259,20 @@ def _build(a, n):
 def initial_state(device):
     pos = torch.zeros(1, 3, device=device)
     vel = torch.zeros(1, 3, device=device)
-    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)   # (w,x,y,z) 水平
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device)   # (w,x,y,z) level
     omega = torch.zeros(1, 3, device=device)
     return pos, vel, quat, omega
 
 
 def test_hover(a, seconds=2.0):
-    """測試 1：推力剛好等於重量時，高度應該不動。"""
+    """Test 1: when thrust exactly equals weight, altitude should not change."""
     sim = make_sim(a)
     device = sim.device
     pos, vel, quat, omega = initial_state(device)
 
-    # QuadrotorSimulator 本身不做夾限，夾限在環境檔（drone_vla_multi_map.py:555）。
-    # 這裡要比照 env 夾，否則推力不足的機體會靠一個 env 根本下不出去的
-    # 指令通過測試。
+    # QuadrotorSimulator itself does no clamping; clamping happens in the env file (drone_vla_multi_map.py:555).
+    # Clamp the same way as the env here, otherwise an underpowered airframe would pass the test with a
+    # command the env can never issue.
     want = a.mass * G / a.max_thrust
     cmd = min(want, THRUST_CMD_MAX)
     thrust_cmd = torch.full((1,), cmd, device=device)
@@ -287,22 +287,22 @@ def test_hover(a, seconds=2.0):
     drift = pos[0, 2].item()
     clipped = want > THRUST_CMD_MAX
     ok = (not clipped) and abs(drift) < 0.01
-    print(f"\n  測試 1  懸停 {seconds:.0f} 秒")
-    print(f"    懸停所需推力指令 = {want:.4f}" +
-          (f"  -> 被夾到 {THRUST_CMD_MAX}" if clipped else ""))
-    print(f"    高度漂移         = {drift * 1000:+.2f} mm   (門檻 ±10 mm)")
-    print(f"    水平漂移         = {pos[0, 0].item() * 1000:+.2f}, "
+    print(f"\n  Test 1  hover {seconds:.0f} s")
+    print(f"    hover thrust command = {want:.4f}" +
+          (f"  -> clamped to {THRUST_CMD_MAX}" if clipped else ""))
+    print(f"    altitude drift       = {drift * 1000:+.2f} mm   (threshold ±10 mm)")
+    print(f"    horizontal drift     = {pos[0, 0].item() * 1000:+.2f}, "
           f"{pos[0, 1].item() * 1000:+.2f} mm")
     if clipped:
-        print(f"    -> FAIL  懸停需求超過指令上限 {THRUST_CMD_MAX}，"
-              f"這台在模擬裡浮不起來")
+        print(f"    -> FAIL  hover requirement exceeds the command limit {THRUST_CMD_MAX}; "
+              f"this airframe cannot get airborne in the sim")
     else:
-        print(f"    -> {'PASS' if ok else 'FAIL  質量或 max_thrust 換算有誤'}")
+        print(f"    -> {'PASS' if ok else 'FAIL  mass or max_thrust conversion is wrong'}")
     return ok
 
 
 def test_full_throttle(a):
-    """測試 2：滿油門的第一步加速度，應等於 (0.5*max_thrust - mg)/m。"""
+    """Test 2: first-step acceleration at full throttle should equal (0.5*max_thrust - mg)/m."""
     sim = make_sim(a)
     device = sim.device
     pos, vel, quat, omega = initial_state(device)
@@ -315,23 +315,23 @@ def test_full_throttle(a):
             pos, vel, quat, omega, (omega_des, thrust_cmd))
     got = lin_acc[0, 2].item()
 
-    # 一個 policy 步內速度已經上升，阻力會讓實測略低於理論值，容差放到 3%
+    # Velocity already rises within one policy step, so drag makes the measurement slightly below theory; tolerance relaxed to 3%
     err = abs(got - expect) / max(abs(expect), 1e-6)
     ok = err < 0.03 and expect > 0
-    print(f"\n  測試 2  滿油門垂直加速度")
-    print(f"    理論值 = {expect:+.4f} m/s^2   (= (0.5 x {a.max_thrust:.2f} "
+    print(f"\n  Test 2  full-throttle vertical acceleration")
+    print(f"    theoretical = {expect:+.4f} m/s^2   (= (0.5 x {a.max_thrust:.2f} "
           f"- {a.mass} x 9.81) / {a.mass})")
-    print(f"    實測值 = {got:+.4f} m/s^2   誤差 {err * 100:.2f}%  (門檻 3%)")
+    print(f"    measured    = {got:+.4f} m/s^2   error {err * 100:.2f}%  (threshold 3%)")
     if expect <= 0:
-        print(f"    -> FAIL  滿油門仍在往下掉，推重比 "
+        print(f"    -> FAIL  still falling at full throttle, thrust-to-weight ratio "
               f"{THRUST_CMD_MAX * a.max_thrust / (a.mass * G):.2f} < 1")
     else:
-        print(f"    -> {'PASS' if ok else 'FAIL  max_thrust 的 x2 換算可能搞錯了'}")
+        print(f"    -> {'PASS' if ok else 'FAIL  the x2 conversion of max_thrust is probably wrong'}")
     return ok
 
 
 def test_rate_step(a, axis=0, seconds=0.5):
-    """測試 3：角速度階躍反應時間，應等於 tau = (I + Kd) / Kp。"""
+    """Test 3: angular-rate step response time should equal tau = (I + Kd) / Kp."""
     sim = make_sim(a)
     device = sim.device
     pos, vel, quat, omega = initial_state(device)
@@ -346,7 +346,7 @@ def test_rate_step(a, axis=0, seconds=0.5):
 
     with torch.no_grad():
         for _ in range(int(seconds / inner_dt)):
-            # 直接呼叫 update() 才能看到每個內圈小步
+            # Call update() directly to see every inner-loop substep
             pos, vel, quat, omega, _, _, _ = sim.update(
                 pos, vel, quat, omega, omega_des, thrust_cmd,
                 torch.zeros(1, device=device))
@@ -356,20 +356,20 @@ def test_rate_step(a, axis=0, seconds=0.5):
 
     name = ("roll x", "pitch y", "yaw z")[axis]
     expect = (a.inertia[axis] + a.kd[axis]) / a.kp[axis]
-    print(f"\n  測試 3  {name} 角速度階躍（指令 {a.br_limit} rad/s）")
-    print(f"    理論 tau = {expect:.4f} s   (= (I + Kd) / Kp)")
+    print(f"\n  Test 3  {name} angular-rate step (command {a.br_limit} rad/s)")
+    print(f"    theoretical tau = {expect:.4f} s   (= (I + Kd) / Kp)")
     if crossed_at is None:
-        print(f"    實測     = 從未達到 63% ({target:.3f} rad/s)，"
-              f"末值 {omega[0, axis].item():.4f}")
-        print(f"    -> FAIL  Kp 太小，或角速度指令超出這組增益撐得住的範圍")
+        print(f"    measured        = never reached 63% ({target:.3f} rad/s), "
+              f"final value {omega[0, axis].item():.4f}")
+        print(f"    -> FAIL  Kp too small, or the rate command exceeds what these gains can handle")
         return False
     err = abs(crossed_at - expect) / expect
-    # 內圈解析度只有 1/freq 秒，tau 很小時單步就佔了不小比例
+    # Inner-loop resolution is only 1/freq s; when tau is small a single step is a sizable fraction of it
     tol = max(0.25, 1.5 * inner_dt / expect)
     ok = err < tol
-    print(f"    實測     = {crossed_at:.4f} s   誤差 {err * 100:.1f}%  "
-          f"(門檻 {tol * 100:.0f}%，受限於 {inner_dt * 1000:.1f} ms 積分解析度)")
-    print(f"    -> {'PASS' if ok else 'FAIL  Kp / Kd / 慣量 有一項不一致'}")
+    print(f"    measured        = {crossed_at:.4f} s   error {err * 100:.1f}%  "
+          f"(threshold {tol * 100:.0f}%, limited by {inner_dt * 1000:.1f} ms integration resolution)")
+    print(f"    -> {'PASS' if ok else 'FAIL  one of Kp / Kd / inertia is inconsistent'}")
     return ok
 
 
@@ -379,7 +379,7 @@ def main():
 
     device = make_sim(a).device
     print("\n" + "=" * 68)
-    print(f"  數值測試  (device={device})")
+    print(f"  Numerical tests  (device={device})")
     print("=" * 68)
     results = [
         test_hover(a),
@@ -390,11 +390,11 @@ def main():
 
     print("\n" + "=" * 68)
     n_pass = sum(results)
-    print(f"  {n_pass}/{len(results)} 通過"
-          + (f"，{len(warns)} 個警告" if warns else ""))
+    print(f"  {n_pass}/{len(results)} passed"
+          + (f", {len(warns)} warnings" if warns else ""))
     print("=" * 68)
 
-    print("\n  要套用這組參數，把以下幾行填進五個環境檔："
+    print("\n  To apply this parameter set, put the following lines into the five environment files:"
           "\n    envs/drone_long_traj.py, drone_multi_gate.py, drone_ppo.py,"
           "\n    drone_vla_long_task.py, drone_vla_multi_map.py\n")
     print(f"        self.min_mass  = {a.mass * 0.95:.4f}")

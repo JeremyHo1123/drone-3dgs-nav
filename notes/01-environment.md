@@ -1,38 +1,38 @@
-# 第 1 章 環境安裝紀錄
+# Chapter 1 Environment installation log
 
-日期：2026-08-11
-環境名稱：`droneenv`（另有輔助 env `sfmtools`）
+Date: 2026-08-11
+Environment name: `droneenv` (plus the helper env `sfmtools`)
 
-## 最終落地版本
+## Final installed versions
 
-| 套件 | 版本 | 備註 |
+| Package | Version | Notes |
 |---|---|---|
 | Python | 3.10.20 | |
-| torch / torchvision | **2.11.0+cu128** / 0.26.0+cu128 | arch list 含 sm_120 |
-| gsplat | **1.4.0（自行源碼編譯，AOT）** | 24 個 cubin 全為 sm_120 |
+| torch / torchvision | **2.11.0+cu128** / 0.26.0+cu128 | arch list includes sm_120 |
+| gsplat | **1.4.0 (built from source, AOT)** | all 24 cubins are sm_120 |
 | nerfstudio | 1.1.5 | |
-| numpy | 1.26.4 | 被 nerfstudio 降版，torch 2.11 相容 |
-| opencv-contrib-python | 4.10.0.84 | 取代 nerfstudio 的 headless 版 |
+| numpy | 1.26.4 | downgraded by nerfstudio, compatible with torch 2.11 |
+| opencv-contrib-python | 4.10.0.84 | replaces nerfstudio's headless build |
 | open3d | 0.19.0 | |
 | gym | 0.26.2 | |
-| transformers | **5.15.0** | ⚠️ 見「待觀察」 |
-| COLMAP | 4.0.4 (CUDA) | 在 `sfmtools` env |
-| ffmpeg | 8.1.2 | 在 `sfmtools` env |
-| nvcc | 系統 12.8.93 @ /usr/local/cuda | 與 torch cu128 同版 |
+| transformers | **5.15.0** | ⚠️ see "To watch" |
+| COLMAP | 4.0.4 (CUDA) | in the `sfmtools` env |
+| ffmpeg | 8.1.2 | in the `sfmtools` env |
+| nvcc | system 12.8.93 @ /usr/local/cuda | same version as torch cu128 |
 
-## 相對 implement.md 的偏離（連同理由）
+## Deviations from the original plan (`implement.md`, not published), with reasons
 
-### 1. 不裝 conda 的 cuda-toolkit（原 1.4 節）
-系統已有 CUDA 12.8.93，且 `torch.utils.cpp_extension.CUDA_HOME` 自動指向
-`/usr/local/cuda`。nvcc 版本與 torch 的 cu128 build **完全一致**，
-沒有 version skew。省下約 3 GB，也避免兩套 nvcc 打架。
+### 1. No conda cuda-toolkit (originally section 1.4)
+The system already has CUDA 12.8.93, and `torch.utils.cpp_extension.CUDA_HOME` automatically points to
+`/usr/local/cuda`. The nvcc version **exactly matches** torch's cu128 build,
+so there is no version skew. This saves about 3 GB and avoids two nvcc installs clashing.
 
-### 2. MAX_JOBS 4 → 12
-本機 94 GB RAM / 24 核，手冊的 4 是為小記憶體機器寫的。
+### 2. MAX_JOBS 4 -> 12
+This machine has 94 GB RAM / 24 cores; the plan's 4 was written for low-memory machines.
 
-### 3. gsplat 編 1.4.0 而非最新版
-nerfstudio 1.1.5 的依賴是 `gsplat ==1.4.0`（精確鎖定）。
-若裝最新版會留下版本衝突。做法是**照它的版本號、但自己編譯**：
+### 3. gsplat built at 1.4.0 rather than latest
+nerfstudio 1.1.5 depends on `gsplat ==1.4.0` (exact pin).
+Installing the latest version would leave a version conflict. The approach: **keep its version number, but build it ourselves**:
 
 ```bash
 export TORCH_CUDA_ARCH_LIST="12.0"; export MAX_JOBS=12; export CUDA_HOME=/usr/local/cuda
@@ -40,90 +40,90 @@ pip install --no-build-isolation --force-reinstall --no-deps \
   "git+https://github.com/nerfstudio-project/gsplat.git@v1.4.0"
 ```
 
-⚠️ **順序**：gsplat 必須在 nerfstudio **之後**裝，否則會被 nerfstudio 的
-PyPI wheel 覆蓋。
+⚠️ **Order**: gsplat must be installed **after** nerfstudio, otherwise it gets overwritten by nerfstudio's
+PyPI wheel.
 
-⚠️ PyPI 上的 `gsplat-1.4.0` 是 `py3-none-any` 的**純 JIT wheel**（無 .so）。
-它不會立刻報 `no kernel image`，而是在首次呼叫時才用本機 nvcc 現編——
-風險是訓練跑到一半停頓，且編譯失敗就整場報銷。AOT 預編可消除此風險。
+⚠️ `gsplat-1.4.0` on PyPI is a `py3-none-any` **pure JIT wheel** (no .so).
+It does not report `no kernel image` right away; instead it compiles with the local nvcc on the first call --
+the risk is a stall halfway through training, and if the build fails the whole run is lost. AOT precompilation removes this risk.
 
-### 4. opencv：移除 headless 換 contrib
-nerfstudio 鎖 `opencv-python-headless ==4.10.0.84`，但它**沒有 aruco**。
-改裝 `opencv-contrib-python==4.10.0.84`（版本對齊，功能是超集）。
-pip 會留下一個未滿足的版本宣告警告，屬預期。
+### 4. opencv: remove headless, use contrib
+nerfstudio pins `opencv-python-headless ==4.10.0.84`, but it **has no aruco**.
+Installed `opencv-contrib-python==4.10.0.84` instead (same version, functionality is a superset).
+pip leaves an unsatisfied-requirement warning, which is expected.
 
-### 5. colmap / ffmpeg 放獨立 env `sfmtools`
-sudo 需要密碼，apt 路線會卡住。conda 直接裝進 droneenv 會拉進
-qt-main 5.15 + pango + nss + 整套 xorg，Qt 衝突會威脅第 7 章的
-open3d 視覺化。做法：獨立 env + 把其 `bin` **附加到 PATH 尾端**
-（尾端是刻意的，droneenv 的 python 必須優先）。
-conda 的執行檔用 RPATH `$ORIGIN/../lib` 找相依，所以那套 Qt 不會滲進來。
+### 5. colmap / ffmpeg in a separate env `sfmtools`
+sudo requires a password, so the apt route gets stuck. Installing via conda directly into droneenv would pull in
+qt-main 5.15 + pango + nss + the whole xorg stack, and Qt conflicts would threaten chapter 7's
+open3d visualization. Approach: a separate env + its `bin` **appended to the end of PATH**
+(the end is deliberate: droneenv's python must take precedence).
+conda executables find their dependencies via RPATH `$ORIGIN/../lib`, so that Qt does not leak in.
 
-## 額外處理的兩個坑（手冊未提及）
+## Two extra pitfalls handled (not mentioned in the plan)
 
-### A. ROS 2 Jazzy 的 PYTHONPATH 洩漏
-系統全域設 `PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages`，
-會插在 sys.path **第一順位**。那是 python3.12 的目錄，droneenv 是 3.10。
-目前掃過無直接撞名，但每裝一個新套件風險就多一分。
+### A. ROS 2 Jazzy PYTHONPATH leak
+The system globally sets `PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages`,
+which is inserted at the **first position** of sys.path. That is a python3.12 directory, while droneenv is 3.10.
+A scan found no direct name collisions so far, but the risk grows with every new package installed.
 
-處理：`droneenv/etc/conda/activate.d/zz_isolate_ros.sh` 只在本 env 內
-清除 PYTHONPATH，deactivate 還原。**全域 ROS 不受影響**（第 12 章要用）。
+Fix: `droneenv/etc/conda/activate.d/zz_isolate_ros.sh` clears PYTHONPATH only inside this env,
+and deactivate restores it. **The global ROS is unaffected** (needed by chapter 12).
 
-### B. conda-forge colmap 套件相依宣告不完整
-`colmap 4.1.1` 與 `4.0.4` 都**沒有宣告 `faiss` 相依**，裝完執行會死在
-`undefined symbol: faiss::IndexIVFFlat::IndexIVFFlat(Index*, ulong, ulong, MetricType)`。
-新版 faiss（1.12+）改了該建構子簽章。
+### B. Incomplete dependency declarations in the conda-forge colmap package
+Neither `colmap 4.1.1` nor `4.0.4` **declares a `faiss` dependency**; once installed, they die at runtime with
+`undefined symbol: faiss::IndexIVFFlat::IndexIVFFlat(Index*, ulong, ulong, MetricType)`.
+Newer faiss (1.12+) changed that constructor's signature.
 
-處理：釘 `libfaiss 1.10.*` + `colmap 4.0.*`，寫在
-`sfmtools/conda-meta/pinned`，避免日後 conda 操作又升級弄壞。
+Fix: pin `libfaiss 1.10.*` + `colmap 4.0.*`, written to
+`sfmtools/conda-meta/pinned`, so later conda operations do not upgrade and break it again.
 
-## 驗證結果（全數通過）
+## Verification results (all passed)
 
 ```
-A. 環境衛生
-  sys.path 無 ROS 洩漏
+A. Environment hygiene
+  no ROS leak in sys.path
   python: droneenv/bin/python   colmap: sfmtools/bin/colmap   ffmpeg: sfmtools/bin/ffmpeg
 B. PyTorch / Blackwell
   torch 2.11.0+cu128 | capability (12,0) | sm_120 in arch list: True | matmul ok
 C. gsplat
-  1.4.0 | 編譯架構 {'sm_120'} | 前向 render max 0.9347 | 反向 grad norm 16541.80
-D. 依賴
+  1.4.0 | compiled archs {'sm_120'} | forward render max 0.9347 | backward grad norm 16541.80
+D. Dependencies
   cv2 4.10.0 (aruco ok) | open3d 0.19.0 | numpy 1.26.4 | gym 0.26.2 | transformers 5.15.0
   COLMAP 4.0.4 | ffmpeg 8.1.2
 E. nerfstudio
-  check_ffmpeg_installed + check_colmap_installed 通過
-  ns-train / ns-process-data / ns-export / ns-viewer 皆可用，splatfacto 存在
+  check_ffmpeg_installed + check_colmap_installed passed
+  ns-train / ns-process-data / ns-export / ns-viewer all available, splatfacto exists
 ```
 
-比手冊多驗的項目（手冊只要求 `import gsplat`，不足）：
-- 用 `cuobjdump --list-elf` 確認 `.so` 內真的是 sm_120 機器碼
-- 實跑 rasterization **前向 + 反向**。GRaD-Nav 走可微分 RL，
-  梯度必須穿得過渲染器，只驗前向不夠
-- ArUco 做生成→偵測往返，並確認 `SOLVEPNP_IPPE_SQUARE` 存在
-- 直接呼叫 nerfstudio 的 `install_checks`，那才是第 6 章真正的門檻
+Checks beyond the plan (the plan only requires `import gsplat`, which is not enough):
+- Used `cuobjdump --list-elf` to confirm the `.so` really contains sm_120 machine code
+- Actually ran rasterization **forward + backward**. GRaD-Nav uses differentiable RL,
+  so gradients must flow through the renderer; checking only the forward pass is not enough
+- ArUco generate -> detect round trip, and confirmed `SOLVEPNP_IPPE_SQUARE` exists
+- Called nerfstudio's `install_checks` directly; that is the real gate for chapter 6
 
-## 給第 6 章的預先發現
+## Early findings for chapter 6
 
-`ColmapConverterToNerfstudioDataset.__post_init__` **無條件**呼叫
-`check_ffmpeg_installed()` 與 `check_colmap_installed()`，失敗即 `sys.exit(1)`。
-**即使 `sfm_tool="hloc"` 也會擋**（hloc 內部用 pycolmap，不用執行檔）。
-這就是為什麼 colmap/ffmpeg 執行檔非裝不可。
+`ColmapConverterToNerfstudioDataset.__post_init__` **unconditionally** calls
+`check_ffmpeg_installed()` and `check_colmap_installed()`, and does `sys.exit(1)` on failure.
+**It blocks even with `sfm_tool="hloc"`** (hloc uses pycolmap internally, not the executables).
+This is why the colmap/ffmpeg executables must be installed.
 
-保尺度的三個旗標屬於 **`nerfstudio-data` dataparser**，不是 method，
-必須寫在 `nerfstudio-data` 之後。實測預設值：
+The three scale-preserving flags belong to the **`nerfstudio-data` dataparser**, not the method,
+and must be written after `nerfstudio-data`. Measured defaults:
 
-| 旗標 | 預設 | 需設為 |
+| Flag | Default | Must be set to |
 |---|---|---|
 | `--orientation-method` | `up` | `none` |
 | `--center-method` | `poses` | `none` |
 | `--auto-scale-poses` | `True` | `False` |
 
-三個預設值**正好都會摧毀公制尺度**。
+All three defaults **happen to destroy the metric scale**.
 
-## 待觀察
+## To watch
 
-- **transformers 5.15.0**：CLIP 類別（CLIPModel/CLIPProcessor/…）都還在，
-  不會 import 失敗。但 5.x 是主版本跳躍，grad_nav 是對 4.x 寫的，
-  processor 預設值與回傳型別可能有差。**第 9/11 章實跑 CLIP 時要驗**，
-  必要時降到 4.x。
-- gym 0.26.2 會印「不支援 NumPy 2.0」的警告。目前 numpy 是 1.26.4，無影響。
+- **transformers 5.15.0**: the CLIP classes (CLIPModel/CLIPProcessor/...) are all still there,
+  so imports do not fail. But 5.x is a major version jump and grad_nav was written against 4.x;
+  processor defaults and return types may differ. **Verify when actually running CLIP in chapters 9/11**,
+  and downgrade to 4.x if needed.
+- gym 0.26.2 prints a "NumPy 2.0 not supported" warning. numpy is currently 1.26.4, so no impact.

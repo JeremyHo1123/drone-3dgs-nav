@@ -38,7 +38,7 @@ Supporting checks, none of which depend on the tape measurement:
 | `splatfacto/2026-08-30_221930/dataparser_transforms.json` | 310 B | Dataparser state, needed to load the checkpoint |
 | `figures/` | 3.7 MB | Verification figures |
 
-**The trained checkpoint is not in this repository.** It is 1.8 GB, over GitHub's 100 MB per-file limit. Download it from the [Releases page](../../releases) — see below.
+**The trained checkpoint is not in this repository.** It is 1.8 GB, over GitHub's 100 MB per-file limit. Download it from the [`scene04-v1` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/scene04-v1) — see below.
 
 The 600 source images (2.3 GB), the SfM intermediates (4.7 GB), and the original video (566 MB) are not published. They can be regenerated from the video with the pipeline in the top-level README.
 
@@ -64,13 +64,15 @@ So you can measure anything directly. The box stack is at roughly `x = −0.73, 
 
 ### Option B — render the full 3DGS
 
-This needs the environment from the top-level README, plus the checkpoint from Releases.
+This needs the environment from the top-level README, plus the checkpoint from the release.
 
 **1. Download the checkpoint**
 
 ```bash
-gh release download scene04-v1 --pattern "*.ckpt" --dir .
+gh release download scene04-v1 -R JeremyHo1123/drone-3dgs-nav --pattern "*.ckpt" --dir .
 ```
+
+Without the GitHub CLI, download it in a browser: <https://github.com/JeremyHo1123/drone-3dgs-nav/releases/download/scene04-v1/step-000029999.ckpt>
 
 **2. Lay the files out like this.** The directory names matter — see the warning below.
 

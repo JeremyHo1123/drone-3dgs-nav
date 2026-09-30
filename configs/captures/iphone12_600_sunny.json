@@ -1,0 +1,39 @@
+{
+    "camera": {
+        "model": "OPENCV",
+        "height": 1920,
+        "width": 1080,
+        "_comment": "Intrinsics COLMAP self-calibrated on THIS video (IMG_2527.MOV), read from workspace/sunny_baseball_field/sfm/transforms.json after the SfM stage. They must match what the SfM used, because solvePnP distance is proportional to fx and a wrong fx scales the whole scene silently. See scenes/scene04/README.md.",
+        "intrinsics_matrix": [
+            [
+                1666.5735448364621,
+                0.0,
+                540.0
+            ],
+            [
+                0.0,
+                1667.973211798216,
+                960.0
+            ],
+            [
+                0.0,
+                0.0,
+                1.0
+            ]
+        ],
+        "distortion_coefficients": [
+            0.1038487366089669,
+            -0.1508474602769519,
+            -0.00011887311857577313,
+            -7.53234252441441e-05
+        ]
+    },
+    "extractor": {
+        "num_images": 600,
+        "num_marked": 20,
+        "marker_length": 0.144,
+        "marker_id": 0,
+        "skip_start_sec": 16,
+        "_comment": "IMG_2527.MOV: the first 16 s show the camera operator's own shadow, so those frames are excluded before sampling."
+    }
+}

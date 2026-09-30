@@ -1,159 +1,159 @@
-# 第 5 章 拍攝場景 + 第 6 章 建立公制 3DGS
+# Chapter 5: Filming the scene + Chapter 6: Building a metric 3DGS
 
-日期：2026-08-13
-場景名稱：`scene01`
-產出：`repos/SousVide/gsplats/workspace/scene01/`
+Date: 2026-08-13
+Scene name: `scene01`
+Outputs: `repos/SousVide/gsplats/workspace/scene01/`
       `outputs/scene01/splatfacto/2026-08-13_083816/`
 
-## 第 5 章 場景影片
+## Chapter 5: Scene video
 
-`captures/IMG_2121.MOV`（在 `gsplats/capture/scene01.MOV` 建了 symlink）
+`captures/IMG_2121.MOV` (symlinked at `gsplats/capture/scene01.MOV`)
 
-| 項目 | 值 | 與標定影片一致 |
+| Item | Value | Matches calibration video |
 |---|---|---|
-| 鏡頭 | 廣角 26 mm f/1.6（1x） | ✓ |
-| 解析度 | 1080 × 1920（容器 1920×1080 + rotation=-90） | ✓ |
-| 幀率 | 29.98 fps | ✓ |
-| 編碼 / 位元率 | H.264 / 15.6 Mbps 原生未壓縮 | ✓ |
-| 長度 | 105.6 秒 / 3167 幀 | 手冊建議 2–3 分鐘，略短但足夠 |
+| Lens | Wide 26 mm f/1.6 (1x) | ✓ |
+| Resolution | 1080 × 1920 (container 1920×1080 + rotation=-90) | ✓ |
+| Frame rate | 29.98 fps | ✓ |
+| Codec / bitrate | H.264 / 15.6 Mbps, native, not recompressed | ✓ |
+| Length | 105.6 s / 3167 frames | The manual recommends 2-3 minutes; slightly short but sufficient |
 
-### 預檢（`tools/preflight_capture.py`）
+### Preflight check (`tools/preflight_capture.py`)
 
-用與 `extract_frames()` 相同的判定邏輯掃過每一幀：
+Scans every frame with the same decision logic as `extract_frames()`:
 
 ```
-含 tag（剛好 1 個且 id=0）:  1148 幀   需要 >= 20  ✓
-不含 tag                    :  2019 幀   需要 >= 280 ✓
-2 個以上 marker（反射誤判）  :    11 幀
-錯誤 id（地板紋理誤判）      :    22 幀
-marker 邊長中位數 171 px（89~224），推估距離 1.43 m
+with tag (exactly 1, id=0)          :  1148 frames   need >= 20  ✓
+without tag                         :  2019 frames   need >= 280 ✓
+2+ markers (false hit, reflection)  :    11 frames
+wrong id (false hit, floor texture) :    22 frames
+median marker side 171 px (89~224), estimated distance 1.43 m
 ```
 
-⚠ **tag 不可全程在畫面中**。`extract_frames` 從「不含 tag」池取 280 張，
-該池為空會 `IndexError`，不足 280 會 `TypeError`（`distribute_values` 把 None
-塞進清單）。兩者皆已實測確認。
+⚠ **The tag must not be in view for the whole video**. `extract_frames` takes 280 images from the "without tag" pool;
+if that pool is empty you get `IndexError`, and if it has fewer than 280 you get `TypeError` (`distribute_values` puts None
+into the list). Both were confirmed by actually running it.
 
-## 第 6 章 建圖：四個上游問題
+## Chapter 6: Building the map: four upstream problems
 
-分階段執行（`tools/build_gsplat.py`）而非直接呼叫 `generate_gsplat()`，
-原因是後者用 `subprocess.run(capture_output=True)` 吞掉訓練輸出，
-且無法在 SfM 與訓練之間插入檢查點。呼叫的是上游同一批函式。
+We run it in stages (`tools/build_gsplat.py`) instead of calling `generate_gsplat()` directly,
+because the latter uses `subprocess.run(capture_output=True)`, which swallows the training output,
+and there is no way to insert a check between SfM and training. It calls the same upstream functions.
 
-### 1. hloc 的 third_party 子模組未初始化
+### 1. hloc's third_party submodules not initialized
 
-**症狀**：`ModuleNotFoundError: No module named 'SuperGluePretrainedNetwork.models'`
+**Symptom**: `ModuleNotFoundError: No module named 'SuperGluePretrainedNetwork.models'`
 
-**原因**：第 2 章為避開龐大的 acados，用
-`git submodule update --init Hierarchical-Localization`（未遞迴），
-漏了 hloc 自己的 `third_party/`。nerfstudio 的 hloc 預設是
-`superpoint_aachen` + `superglue`，兩者都來自該子模組。
+**Cause**: in Chapter 2, to avoid the huge acados, we used
+`git submodule update --init Hierarchical-Localization` (non-recursive),
+which missed hloc's own `third_party/`. nerfstudio's hloc defaults are
+`superpoint_aachen` + `superglue`, and both come from that submodule.
 
-**處理**：
+**Fix**:
 ```bash
 cd FiGS/Hierarchical-Localization
 git submodule update --init third_party/SuperGluePretrainedNetwork
 ```
-只補這一個。`d2net`/`r2d2` 是替代特徵器、`deep-image-retrieval` 只有 vocab_tree
-檢索才需要，我們走 exhaustive 都用不到；hloc 用 `dynamic_load` 延遲載入。
+Only this one is added. `d2net`/`r2d2` are alternative feature extractors and `deep-image-retrieval` is only needed for vocab_tree
+retrieval; we use exhaustive matching and need none of them. hloc loads them lazily with `dynamic_load`.
 
-### 2. pycolmap API 不相容
+### 2. pycolmap API incompatibility
 
-**症狀**：`TypeError: import_images(): incompatible function arguments`
+**Symptom**: `TypeError: import_images(): incompatible function arguments`
 
-**原因**：hloc（2024 年的 commit）用 `import_images(..., image_list=)`
-與 dict 型別的 `incremental_mapping(options=...)`；
-pycolmap **4.1.1** 已改名為 `image_names=`，options 也改成必須是
-`IncrementalPipelineOptions` 型別。
+**Cause**: hloc (a 2024 commit) uses `import_images(..., image_list=)`
+and a dict-typed `incremental_mapping(options=...)`;
+pycolmap **4.1.1** renamed it to `image_names=`, and options must now be of type
+`IncrementalPipelineOptions`.
 
-⚠ 第 2 章的 `import pycolmap` 測試會通過——**import 成功不代表函式簽章相容**。
+⚠ The Chapter 2 `import pycolmap` test passes anyway: **a successful import does not mean the function signatures are compatible**.
 
-**處理**：`pip install --no-deps pycolmap==0.6.1`（hloc 當初對應的版本）。
-比逐一修改上游多處呼叫乾淨。已確認 0.6.1 同時滿足 hloc 與 nerfstudio
-（`ImageReaderOptions` / `CameraMode` / `verify_matches` / `triangulate_points` 皆在）。
+**Fix**: `pip install --no-deps pycolmap==0.6.1` (the version hloc was written against).
+This is cleaner than patching the many upstream call sites one by one. Confirmed that 0.6.1 satisfies both hloc and nerfstudio
+(`ImageReaderOptions` / `CameraMode` / `verify_matches` / `triangulate_points` are all present).
 
-### 3. hloc 搬錯重建模型（最陰險，不會報錯）
+### 3. hloc moves the wrong reconstruction model (the most insidious: no error is raised)
 
-**症狀**：hloc 記錄 `Largest model is #1 with 300 images`、
-`num_reg_images = 300`，但 nerfstudio 報
-`COLMAP only found poses for 0.67% of the images`，`transforms.json` 只有 2 個 frame。
+**Symptom**: hloc logs `Largest model is #1 with 300 images` and
+`num_reg_images = 300`, but nerfstudio reports
+`COLMAP only found poses for 0.67% of the images`, and `transforms.json` has only 2 frames.
 
-**原因**：`run_reconstruction` 第 102 行用 `reconstructions` 的**字典 key**
-當資料夾名去搬（`models_path / str(largest_index)`），但 pycolmap 0.6.1 回傳的
-字典 key 與它實際寫到磁碟的資料夾編號**對不起來**。磁碟上 `models/0` 才是
-300 張的大模型，`models/1` 是 2 張的小模型。
+**Cause**: line 102 of `run_reconstruction` uses the **dict key** of `reconstructions`
+as the folder name to move (`models_path / str(largest_index)`), but the dict keys returned by pycolmap 0.6.1
+**do not match** the folder numbers it actually writes to disk. On disk, `models/0` is the
+large 300-image model and `models/1` is a small 2-image model.
 
-**處理（兩件事）**：
-- 立即修正：把 `models/0/*.bin` 複製回 `sparse/0/`，再直接呼叫
+**Fix (two parts)**:
+- Immediate fix: copy `models/0/*.bin` back into `sparse/0/`, then call
   `colmap_to_json(recon_dir=..., output_dir=..., image_rename_map=None,
-  use_single_camera_mode=True)` 重新產生 transforms.json。
-  （確認過 `images/` 與 `sfm/images/` 檔名集合完全相同 → rename_map 是 identity）
-- 永久修正：patch `hloc/reconstruction.py`，改為**掃描磁碟上的模型目錄、
-  用 `pycolmap.Reconstruction(d).num_reg_images()` 取最大者**，標記為 `PATCH(drone)`。
-  ⚠ 這是改在 git submodule 內，`git checkout`/重新 clone 會被還原。
+  use_single_camera_mode=True)` directly to regenerate transforms.json.
+  (Confirmed that the file name sets of `images/` and `sfm/images/` are identical -> rename_map is the identity)
+- Permanent fix: patch `hloc/reconstruction.py` to **scan the model directories on disk and
+  pick the one with the largest `pycolmap.Reconstruction(d).num_reg_images()`**, marked `PATCH(drone)`.
+  ⚠ This change lives inside a git submodule; `git checkout` or a fresh clone will revert it.
 
-### 4. 兩個計數差異（非錯誤，但要理解）
+### 4. Two count discrepancies (not errors, but worth understanding)
 
-- **抽出的 300 張裡含 tag 的是 22 張而非 20**：`extract_frames` 先循序讀取分箱
-  並記錄毫秒時間戳，之後用 `cap.set(CAP_PROP_POS_MSEC)` 跳回去取幀。
-  H.264 的毫秒 seek 不精確，會落在鄰近幀；你的影片 36% 的幀含 tag，
-  於是 2 個原本歸類為「無 tag」的時間戳 seek 後落到含 tag 的鄰近幀。
-- **check 階段數到 20 張**：因為它複製了 `extract_positions` 的讀圖路徑
-  （`imread(f)` 再 `cvtColor(BGR2GRAY)`），與直接 `imread(f, IMREAD_GRAYSCALE)`
-  的灰階轉換有微小差異，翻轉 2 張邊緣個案。**20 才是有效數字**，
-  且恰好等於 `num_marked`，所以 `extract_positions` 通過。
+- **22 of the 300 extracted images contain the tag, not 20**: `extract_frames` first reads the bins sequentially
+  and records millisecond timestamps, then jumps back with `cap.set(CAP_PROP_POS_MSEC)` to grab the frames.
+  Millisecond seeking in H.264 is imprecise and lands on a nearby frame; 36% of the frames in your video contain the tag,
+  so 2 timestamps originally classified as "no tag" landed on nearby frames containing the tag after seeking.
+- **The check stage counts 20 images**: because it replicates the image-reading path of `extract_positions`
+  (`imread(f)` then `cvtColor(BGR2GRAY)`), whose grayscale conversion differs slightly from calling `imread(f, IMREAD_GRAYSCALE)`
+  directly, flipping 2 borderline cases. **20 is the number that counts**,
+  and it exactly equals `num_marked`, so `extract_positions` passes.
 
-## 結果
-
-```
-SfM 註冊率                300/300 = 100%
-已註冊影像中含 tag        20 張（== num_marked ✓）
-3D 點                     47194，觀測 305908，平均重投影誤差 1.48 px
-Sim(3)                    cs = 0.288849（RANSAC 20 點中 17 inlier，門檻 5 cm）
-訓練                      30000 步 / 16 分鐘 / 約 32 ms per step
-高斯數量                  1,401,340
-訓練解析度                540×960（images_2，nerfstudio 自動降尺度，MAX_AUTO_RESOLUTION=1600）
-```
-
-100% 註冊率代表拍攝品質好：重疊充足、無動態模糊、無覆蓋空洞。
-
-### 尺度的初步跡象（第 7 章正式驗收）
-
-稀疏點雲的完整 bbox 是 14.82 × 29.09 × 11.05 m，**但那被離群點主導**，
-穩健統計才有意義：
+## Results
 
 ```
-5~95 百分位範圍 (m):  x 5.38   y 5.32   z 1.51
-z 的 5/50/95 百分位 : -0.04 / 0.48 / 1.48
-距 ArUco 水平 1.5 m 內的 9821 個點，z 中位數 = 0.0116 m
+SfM registration rate     300/300 = 100%
+registered images w/ tag  20 (== num_marked ✓)
+3D points                 47194, observations 305908, mean reprojection error 1.48 px
+Sim(3)                    cs = 0.288849 (RANSAC: 17 of 20 points inliers, threshold 5 cm)
+training                  30000 steps / 16 minutes / about 32 ms per step
+number of Gaussians       1,401,340
+training resolution       540x960 (images_2, nerfstudio auto-downscale, MAX_AUTO_RESOLUTION=1600)
 ```
 
-**tag 附近地板落在 z ≈ 1.2 cm、z 軸向上** → 原點在 ArUco 上、
-世界 z 軸為重力反方向，符合飛行需求。
+A 100% registration rate means good capture quality: plenty of overlap, no motion blur, no coverage holes.
 
-### ⚠ 待第 7 章裁決：內參的 2.68% 落差
+### Early signs about the scale (formal acceptance in Chapter 7)
 
-| 內參 | fx | cs | Sim(3) 殘差中位數 |
+The full bbox of the sparse point cloud is 14.82 × 29.09 × 11.05 m, **but it is dominated by outliers**;
+only robust statistics are meaningful:
+
+```
+5~95 percentile range (m):  x 5.38   y 5.32   z 1.51
+z 5/50/95 percentiles     : -0.04 / 0.48 / 1.48
+9821 points within 1.5 m horizontally of the ArUco: median z = 0.0116 m
+```
+
+**The floor near the tag sits at z ≈ 1.2 cm, with the z axis pointing up** -> the origin is on the ArUco and
+the world z axis is opposite to gravity, as flight requires.
+
+### ⚠ To be decided in Chapter 7: the 2.68% intrinsics discrepancy
+
+| Intrinsics | fx | cs | Median Sim(3) residual |
 |---|---|---|---|
-| 我們的標定（第 3 章） | 1702.28 | 0.288444 | **1.36 cm** |
-| COLMAP 自估 | 1664.67 | 0.280903 | 1.83 cm |
+| Our calibration (Chapter 3) | 1702.28 | 0.288444 | **1.36 cm** |
+| COLMAP self-estimate | 1664.67 | 0.280903 | 1.83 cm |
 
-`solvePnP` 的距離正比於 fx，故 **2.68% 的 fx 差異 = 2.68% 的場景尺度差異**，
-剛好踩在第 7 章 2% 標準的邊緣。
+The `solvePnP` distance is proportional to fx, so **a 2.68% fx difference = a 2.68% scene scale difference**,
+right at the edge of the Chapter 7 2% criterion.
 
-殘差**支持我們的標定**（1.36 < 1.83 cm，且我們的 cs 較大、距離放大 2.7%
-的情況下殘差仍較小）。但 COLMAP 的畸變係數（k1=0.103, k2=-0.147）比我們的
-（0.220, -0.716）溫和許多，與第 3 章「畸變解可能是病態的」警告一致。
+The residuals **favor our calibration** (1.36 < 1.83 cm, and our residual is still smaller even though our larger cs scales distances up by 2.7%).
+But COLMAP's distortion coefficients (k1=0.103, k2=-0.147) are much milder than ours
+(0.220, -0.716), consistent with the Chapter 3 warning that "the distortion solution may be ill-conditioned".
 
-**判讀方式**：第 7 章量已知物體長度。
-- 相符 → 維持現狀
-- 偏大約 2.7% → 把 `configs/captures/iphone12.json` 的 `camera` 設為 `null`
-  （FiGS 會 fallback 到 SfM 內參），**只需重跑 `--stage scale`**。
-  尺度只影響 transforms.json 與點雲，**不需重跑 SfM，也不需重新訓練 3DGS**。
+**How to decide**: measure the length of a known object in Chapter 7.
+- Matches -> keep things as they are
+- About 2.7% too large -> set `camera` in `configs/captures/iphone12.json` to `null`
+  (FiGS then falls back to the SfM intrinsics), and **only rerun `--stage scale`**.
+  Scale only affects transforms.json and the point cloud; **no need to rerun SfM or retrain the 3DGS**.
 
-另記：RANSAC 有隨機性，兩次執行的 cs 為 0.288849 / 0.288444，差 0.14%。
+Also noted: RANSAC is random; two runs gave cs = 0.288849 / 0.288444, a 0.14% difference.
 
-## 渲染驗證
+## Render check
 
-`notes/ch6_render/` 三張，從訓練相機位姿渲染：
-畫面清晰可辨——ArUco 紙板、木地板、拖鞋、機械手臂、桌椅、線材，
-與實地照片一致。管線正確。
+Three images in `notes/ch6_render/`, rendered from training camera poses:
+the images are sharp and recognizable (the ArUco board, wooden floor, slippers, robot arm, tables and chairs, cables)
+and match photos of the real place. The pipeline is correct.

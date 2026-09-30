@@ -1,71 +1,71 @@
-# 第 0 章 前置檢查紀錄
+# Chapter 0 Precheck log
 
-日期：2026-08-10
+Date: 2026-08-10
 
-## 驅動層（implement.md 第 0 章要求）
+## Driver layer (required by chapter 0 of the original plan, `implement.md`, not published)
 
-| 檢查項 | 要求 | 實測 | 結果 |
+| Check | Requirement | Measured | Result |
 |---|---|---|---|
 | Driver Version | >= 570.xx | 580.126.09 | ✅ |
 | nvidia-smi CUDA Version | >= 12.8 | 13.0 | ✅ |
 | compute_cap | 12.0 (sm_120) | 12.0 | ✅ |
 | GPU / VRAM | RTX 5070 Ti / 16 GB | RTX 5070 Ti / 16303 MiB | ✅ |
 
-桌面環境（Xorg + gnome-shell + 瀏覽器）常駐佔用約 661 MiB，
-實際可用約 15.6 GB。第 10.3 節調 `num_actors` 時要把這扣掉。
+The desktop environment (Xorg + gnome-shell + browser) constantly uses about 661 MiB,
+so about 15.6 GB is actually available. Subtract this when tuning `num_actors` in section 10.3.
 
-## 額外環境盤點
+## Additional environment inventory
 
 - OS: Ubuntu 24.04.4 LTS (noble)
 - conda 25.7.0 @ /home/jeremy/anaconda3
-- 磁碟：/ 剩餘 524 GB，充裕
-- gcc/g++ 13.3.0 — CUDA 12.8 可接受的版本
-- **系統已有 CUDA toolkit 12.8.93 @ /usr/local/cuda**（nvcc 可用）
-- ffmpeg **未安裝** → 第 5、6 章處理影片前要補
+- Disk: 524 GB free on /, plenty
+- gcc/g++ 13.3.0 - a version CUDA 12.8 accepts
+- **The system already has CUDA toolkit 12.8.93 @ /usr/local/cuda** (nvcc available)
+- ffmpeg **not installed** -> must be added before processing video in chapters 5 and 6
 
-## 對第 1 章的影響（重要）
+## Impact on chapter 1 (important)
 
-附錄 C 標示第 1 章「未實測」，但這台機器已有既存環境
-`gaussian_splatting_128` 實測可用：
+Appendix C (of the original plan) marks chapter 1 as "not tested", but this machine already has an existing environment
+`gaussian_splatting_128` that was tested and works:
 
 ```
 torch: 2.9.0+cu128
 cuda build: 12.8
 arch list: ['sm_70','sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']
 capability: (12, 0)
-實際 GPU matmul 成功
+GPU matmul actually succeeded
 ```
 
-→ 結論：**torch 2.9.0+cu128 在本機的 sm_120 上確認能實際執行 kernel**，
-不需要走 nightly。第 1.3 節的最大不確定性已排除。
+-> Conclusion: **torch 2.9.0+cu128 is confirmed to actually run kernels on this machine's sm_120**,
+so there is no need for a nightly build. The biggest uncertainty in section 1.3 is ruled out.
 
-→ 第 1.4 節（conda 裝 cuda-toolkit）可改用系統的 /usr/local/cuda 12.8，
-省下約 3 GB 且避免 conda 與系統 nvcc 版本打架。
+-> Section 1.4 (installing cuda-toolkit via conda) can use the system /usr/local/cuda 12.8 instead,
+saving about 3 GB and avoiding version clashes between conda's and the system's nvcc.
 
-## 建立的目錄
+## Directories created
 
 ~/drone/{repos,refs,gsplats,captures,notes}
 
-## 路徑統一（2026-08-11，事後異動）
+## Path unification (2026-08-11, later change)
 
-原先依 implement.md 第 0 章建立的工作目錄是 `~/drone-env`，與專案文件所在的
-`~/drone` 分開，造成兩個根目錄。已合併為單一根目錄 **`~/drone`**。
+The working directory originally created per chapter 0 of `implement.md` was `~/drone-env`, separate from
+`~/drone` where the project documents live, which gave two root directories. They have been merged into a single root **`~/drone`**.
 
-搬移時必須連帶處理的事（下次若再搬要照做）：
+Things that had to be handled as part of the move (do the same if it is ever moved again):
 
-1. `mv ~/drone-env/* ~/drone/` —— 同一檔案系統，是瞬間完成的中繼資料操作
-2. **`hloc` 與 `figs` 是 editable 安裝，搬完會 `ModuleNotFoundError`**。
-   必須重裝，且**一定要加 `--no-deps`**，否則會再次把
-   `opencv-python` 與 `opencv-python-headless` 拉回來蓋掉 contrib 版：
+1. `mv ~/drone-env/* ~/drone/` -- same filesystem, so it is an instant metadata operation
+2. **`hloc` and `figs` are editable installs; after the move they give `ModuleNotFoundError`**.
+   They must be reinstalled, and **always with `--no-deps`**, otherwise
+   `opencv-python` and `opencv-python-headless` get pulled back in and overwrite the contrib build:
    ```bash
    pip install -e ./FiGS/Hierarchical-Localization/ --no-deps --force-reinstall
    pip install -e ./FiGS/ --no-deps --force-reinstall
    ```
-3. `tools/calibrate_camera.py` 的絕對路徑改成由 `Path(__file__)` 推導的
-   `PROJECT_ROOT`，之後再搬就不用改程式
-4. `implement.md` 內 13 處 `~/drone-env` 已改為 `~/drone`（只動路徑字串，
-   技術內容未變），檔案開頭有異動說明
-5. nerfstudio 的 patch 註解標籤由 `PATCH(drone-env)` 改為 `PATCH(drone)`
+3. The absolute paths in `tools/calibrate_camera.py` were changed to a `PROJECT_ROOT` derived from
+   `Path(__file__)`, so future moves need no code changes
+4. The 13 occurrences of `~/drone-env` in `implement.md` were changed to `~/drone` (only path strings changed,
+   technical content unchanged); a change note was added at the top of the file
+5. The comment tag of the nerfstudio patch was changed from `PATCH(drone-env)` to `PATCH(drone)`
 
-搬移後回歸驗證全過：torch/gsplat/cv2(aruco)/colmap/ffmpeg 正常、
-hloc 與 figs 指向新路徑、第 2 章渲染測試重跑成功、標定腳本預設路徑正確。
+Regression checks after the move all passed: torch/gsplat/cv2(aruco)/colmap/ffmpeg work,
+hloc and figs point to the new path, the chapter 2 render test re-ran successfully, and the calibration script's default paths are correct.

@@ -1,113 +1,113 @@
-# 3DGS 品質實驗：三個場景的對照
+# 3DGS quality experiments: comparing three scenes
 
-日期：2026-08-20
-目的：找出影響重建品質的變因（此階段為實驗，尚未部署到無人機）
+Date: 2026-08-20
+Purpose: identify the factors that affect reconstruction quality (this stage is experimental and has not been deployed to the drone yet)
 
-## 三個場景
+## The three scenes
 
 | | scene01 | scene02 | scene03 |
 |---|---|---|---|
-| 影片 | IMG_2121 (1'46", 3167幀) | IMG_2154 (3'01", 5449幀) | IMG_2121 (同 scene01) |
-| 張數 | 300 | 400 | 400 |
-| 選幀 | 上游 extract_frames（毫秒 seek） | 均勻 FPS（幀索引） | 均勻 FPS（幀索引） |
+| Video | IMG_2121 (1'46", 3167 frames) | IMG_2154 (3'01", 5449 frames) | IMG_2121 (same as scene01) |
+| Images | 300 | 400 | 400 |
+| Frame selection | upstream extract_frames (millisecond seek) | uniform FPS (frame index) | uniform FPS (frame index) |
 | config | iphone12 | iphone12_400 | iphone12_400 |
 
-scene02 vs scene03 是控制得最好的一組：張數、選幀、器材、場地全部相同，
-**唯一差別是拍攝時的走位方式**。
+scene02 vs scene03 is the best-controlled pair: image count, frame selection, equipment and location are all identical;
+**the only difference is how the camera operator walked while filming**.
 
-## 結果
+## Results
 
-| 指標 | scene01 | scene02 | scene03 | 原作 backroom |
+| Metric | scene01 | scene02 | scene03 | Original authors' backroom |
 |---|---|---|---|---|
-| 軌跡二維程度（PC2/PC1） | 0.29 | **0.08** | 0.27 | **0.43** |
-| SfM 註冊率 | 100% | 100% | 100% | — |
-| 重投影誤差 (px) | 1.479 | 1.398 | 1.502 | — |
-| **ArUco 尺度一致性（IQR/中位數）** | 2.3% ✓ | **106.7% ✗** | 3.3% ✓ | — |
-| ArUco vs SfM 距離相關係數 | 0.9872 | **0.2876** | 0.9872 | — |
+| Trajectory two-dimensionality (PC2/PC1) | 0.29 | **0.08** | 0.27 | **0.43** |
+| SfM registration rate | 100% | 100% | 100% | — |
+| Reprojection error (px) | 1.479 | 1.398 | 1.502 | — |
+| **ArUco scale consistency (IQR/median)** | 2.3% ✓ | **106.7% ✗** | 3.3% ✓ | — |
+| ArUco vs SfM distance correlation | 0.9872 | **0.2876** | 0.9872 | — |
 | RANSAC inliers | 17/20 | **5/20** | 17/20 | — |
-| cs | 0.2888 | (無效) | 0.3011 | — |
-| 高斯數量 | 1,401,340 | 1,242,877 | 1,388,962 | 535,006 |
-| 訓練 PSNR | 22.24 | 23.14 | 22.10 | **30.64** |
+| cs | 0.2888 | (invalid) | 0.3011 | — |
+| Number of Gaussians | 1,401,340 | 1,242,877 | 1,388,962 | 535,006 |
+| Training PSNR | 22.24 | 23.14 | 22.10 | **30.64** |
 | eval PSNR | 21.12 | 21.15 | 20.86 | **27.79** |
-| 訓練−eval 差距 | +1.12 | **+1.99** | +1.24 | +2.85 |
+| Training - eval gap | +1.12 | **+1.99** | +1.24 | +2.85 |
 
-## 確定的結論
+## Firm conclusions
 
-### 1. 張數 300 → 400 沒有幫助
-同一支影片、同樣軌跡（scene01 vs scene03），eval PSNR 21.12 → 20.86。
-**張數不是瓶頸。**
+### 1. Going from 300 to 400 images does not help
+Same video, same trajectory (scene01 vs scene03): eval PSNR 21.12 -> 20.86.
+**Image count is not the bottleneck.**
 
-### 2. 軌跡形狀是目前影響最大的變因
-scene02 的相機路徑幾乎是一條直線（PC2/PC1 = 0.08，scene01/03 是 0.27~0.29）。
-使用者確認：沿同一條走道來回走，因為那條走道剛好沒人。
+### 2. Trajectory shape is currently the most influential factor
+scene02's camera path is almost a straight line (PC2/PC1 = 0.08, vs 0.27-0.29 for scene01/03).
+The user confirmed: they walked back and forth along the same corridor, because that corridor happened to be empty.
 
-後果：
-- 任何相似變換都無法同時滿足 20 個 ArUco 點（離散度 106.7%）
-- 偏離拍攝路徑約 4 倍軌跡寬度時地板已成拖影，7 倍時整個畫面只剩色塊
-- 訓練 PSNR 反而最高（23.14）→ 過度貼合拍攝路徑的徵兆
+Consequences:
+- No similarity transform can satisfy all 20 ArUco points at once (dispersion 106.7%)
+- At about 4x the trajectory width away from the capture path the floor is already smeared; at 7x the whole image is just color blobs
+- Training PSNR is actually the highest (23.14) -> a sign of overfitting to the capture path
 
-⚠ **SfM 自己的每一項指標都是綠燈**（100% 註冊、1.398 px 重投影誤差、單一模型），
-只有外部的公制參考（ArUco）才揪得出來。重投影誤差低只代表「這組解能解釋拍到的
-影像」，不代表對應真實幾何。
+⚠ **Every one of SfM's own metrics is green** (100% registration, 1.398 px reprojection error, a single model);
+only the external metric reference (ArUco) catches the problem. A low reprojection error only means "this solution explains the captured
+images", not that it matches the real geometry.
 
-### 3. 這些不是主因（已逐項排除）
-- **動態模糊**：原作 backroom 的 Laplacian 中位數 71，比使用者的還低
-- **曝光/白平衡**：亮度變異 12.3% vs 原作 12.5%；色溫 4.32% vs 4.52%
-- **內參**：換成 COLMAP 自估內參後 scene02 反而更差（106.7% → 122.5%）
-- **含 tag 影像的品質**：只留 marker>=150px 且傾角<=45° 的 8 張，離散度仍 109%
-- **tag 被移動**：各時段的相機質心接近，且開頭段內部就已不一致
+### 3. These are not the main cause (ruled out one by one)
+- **Motion blur**: the original backroom has a median Laplacian of 71, even lower than the user's
+- **Exposure/white balance**: brightness variation 12.3% vs 12.5% in the original work; color temperature 4.32% vs 4.52%
+- **Intrinsics**: switching to COLMAP's self-estimated intrinsics made scene02 even worse (106.7% -> 122.5%)
+- **Quality of the images containing the tag**: keeping only the 8 images with marker>=150px and tilt<=45°, the dispersion is still 109%
+- **The tag was moved**: the camera centroids of the different time segments are close, and the opening segment is already inconsistent internally
 
-### 4. Laplacian 變異數不是「模糊指標」
-它同時受畫面內容影響。scene02 分數最低的 10 張**完全不糊，是拍得很清楚的空白牆**；
-scene03 分數最低的才是真的動態模糊。同一場景內比較才有意義。
+### 4. Laplacian variance is not a "blur metric"
+It is also affected by image content. The 10 lowest-scoring images of scene02 **are not blurry at all; they are sharp shots of a blank wall**;
+the lowest-scoring ones of scene03 are the ones with real motion blur. Comparisons are only meaningful within the same scene.
 
-### 5. scene02 有 17% 的畫面浪費在空白牆上
+### 5. scene02 wastes 17% of its frames on blank walls
 
-| 場景 | 低紋理面積佔比 | >50% 空白的幀 | >70% 空白的幀 |
+| Scene | Low-texture area share | Frames >50% blank | Frames >70% blank |
 |---|---|---|---|
 | scene01 | 24.6% | 4 | 0 |
 | **scene02** | **37.8%** | **69** | **7** |
 | scene03 | 24.9% | 7 | 0 |
-| 原作 backroom | 35.6% | **0** | **0** |
+| Original authors' backroom | 35.6% | **0** | **0** |
 
-原作者的低紋理總面積其實相當（35.6%），但**沒有任何一幀是被空白主導的**——
-他們的無紋理區域是分散的（每幀都有素色地板，但同時也有內容）。
-scene02 有連續一大段（frame_00360~00378）都在拍牆。
+The original authors' total low-texture area is actually comparable (35.6%), but **not a single frame is dominated by blank area**:
+their textureless regions are spread out (every frame has plain floor, but also has content).
+scene02 has one long continuous stretch (frame_00360~00378) filming the wall.
 
-## 與原作者仍有 7 dB 差距，已知的部分原因
+## Still a 7 dB gap to the original authors; known partial causes
 
-- **場景內容更複雜**：平均梯度 28~29 vs 原作 20.6（高約 40%）。
-  PSNR 天生懲罰高頻細節——scene03 訓練影像更銳利（Laplacian 134 vs 106）
-  eval PSNR 反而更低，正是這個效應。
-- **軌跡二維程度仍不足**：原作 0.43，最好的 scene03 是 0.27。
+- **More complex scene content**: mean gradient 28-29 vs 20.6 in the original (about 40% higher).
+  PSNR inherently penalizes high-frequency detail: scene03's training images are sharper (Laplacian 134 vs 106),
+  yet its eval PSNR is lower, which is exactly this effect.
+- **Trajectory still not two-dimensional enough**: the original is 0.43, our best (scene03) is 0.27.
 
-## 下次拍攝的具體建議
+## Concrete recommendations for the next capture
 
-1. **走環形路線**，繞著場景或主要物件轉，每圈路徑略微不同
-2. **變換高度**：蹲下、站立、手舉高各拍一趟。這是在狹窄空間裡把軌跡從一維
-   變二維最省力的做法
-3. **對重要物件側向平移**，讓它從不同角度入鏡
-4. **相機始終對著有內容的方向**，不要長時間拍空白牆
-5. **改用橫式**：原作者是 1920×1080 橫式；直式時畫面很大一片是重複紋理的地板，
-   且機載相機（640×360）也是橫式
-6. 判斷標準：把走過的路線畫在地面平面圖上，**是一條線還是一片區域**
+1. **Walk a loop**, circling the scene or the main objects, with a slightly different path each lap
+2. **Vary the height**: do one pass crouching, one standing, and one with the phone held high. In a narrow space this is the least-effort way to turn
+   a one-dimensional trajectory into a two-dimensional one
+3. **Translate sideways past important objects**, so they enter the frame from different angles
+4. **Always point the camera at something with content**; do not film blank walls for long stretches
+5. **Switch to landscape**: the original authors used 1920×1080 landscape; in portrait a large part of the image is floor with repetitive texture,
+   and the onboard camera (640×360) is also landscape
+6. Criterion: draw the path you walked on a floor plan: **is it a line or an area?**
 
-## 產出的檔案
+## Output files
 
 ```
-review/scene0X_NNNimgs/          → 訓練影像（symlink）
-review/sheets_scene0X/           → 接觸表 + 最銳利/最模糊各 10 張
-notes/eval_scene0X/              → 沿路徑與偏離路徑的渲染對照
-notes/traj_compare.png           → scene01 vs scene02 的相機軌跡圖
-tools/eval_gsplat.py             → 統一的場景評估工具
-tools/make_contact_sheet.py      → 接觸表產生器
+review/scene0X_NNNimgs/          -> training images (symlinks)
+review/sheets_scene0X/           -> contact sheets + the 10 sharpest / 10 blurriest
+notes/eval_scene0X/              -> renders on-path vs off-path for comparison
+notes/traj_compare.png           -> camera trajectory plot, scene01 vs scene02
+tools/eval_gsplat.py             -> unified scene evaluation tool
+tools/make_contact_sheet.py      -> contact sheet generator
 ```
 
-## 工具的改動
+## Tool changes
 
-`tools/build_gsplat.py` 新增 `--select {uniform,sharp}`：
-- `uniform`（預設）＝原作者的一維最遠點取樣。上游 `distribute_values` 是
-  O(n·k²) 純 Python（3937 選 380 要十幾分鐘），改用 numpy 維護最小距離陣列，
-  **已用 4 組含空洞的隨機測資驗證選出的值完全相同**，耗時 0.002 秒。
-- 取幀改用幀索引 + 全程循序讀取，避開上游毫秒 seek 的偏移
-  （scene01 因此多抽到 2 張含 tag 的影像）。scene02/03 實測都是剛好 20 張。
+`tools/build_gsplat.py` gains `--select {uniform,sharp}`:
+- `uniform` (default) = the original authors' 1-D farthest-point sampling. The upstream `distribute_values` is
+  O(n·k²) pure Python (choosing 380 out of 3937 takes over ten minutes); it now uses numpy to maintain a minimum-distance array,
+  **verified on 4 random test sets with gaps to select exactly the same values**, in 0.002 s.
+- Frame grabbing now uses frame indices + a single sequential read of the whole video, avoiding the offset from upstream's millisecond seek
+  (which is why scene01 got 2 extra images containing the tag). scene02/03 were measured to have exactly 20 each.

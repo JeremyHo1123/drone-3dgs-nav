@@ -1,23 +1,23 @@
 """
-第 6 章建圖前的預檢。
+Pre-check before the chapter 6 scene reconstruction.
 
-用與 FiGS `extract_frames()` 完全相同的判定邏輯掃過影片每一幀，
-在跑昂貴的 SfM + 3DGS 訓練之前，先確認資料本身不會讓管線失敗。
+Scans every frame of the video with exactly the same decision logic as FiGS `extract_frames()`,
+to confirm, before running the expensive SfM + 3DGS training, that the data itself will not make the pipeline fail.
 
-檢查的失敗模式（都已讀原始碼確認）：
-  1. 含 tag 的幀 < num_marked(20)
-     → extract_frames 走警告分支，但下游 extract_positions 硬性要求
-       數量「剛好等於」num_marked，必然拋
+Failure modes checked (all confirmed by reading the source):
+  1. Frames with the tag < num_marked(20)
+     -> extract_frames takes the warning branch, but the downstream extract_positions strictly requires
+       the count to be EXACTLY num_marked, so it always raises
        ValueError: Mismatched number of aruco and sfm transforms
-  2. 不含 tag 的幀 < num_images - num_marked(280)
-     → distribute_values 找不到候選時把 None 塞進清單 →
+  2. Frames without the tag < num_images - num_marked(280)
+     -> when distribute_values finds no candidate it puts None into the list ->
        TypeError: '>' not supported between 'float' and 'NoneType'
-  3. 完全沒有不含 tag 的幀
-     → distribute_values 的 values[0] → IndexError
-  4. 反射造成一幀偵測到 2 個以上 marker
-     → len(ids)==1 不成立，該幀被歸入「不含 tag」池，兩邊都吃虧
+  3. No frames without the tag at all
+     -> values[0] in distribute_values -> IndexError
+  4. Reflections make a frame detect 2 or more markers
+     -> len(ids)==1 fails, the frame goes into the "no tag" pool, and both sides lose
 
-用法:
+Usage:
   python preflight_capture.py --video <path> --config iphone12
 """
 import argparse
@@ -34,9 +34,9 @@ CFG = PROJECT_ROOT / "repos/SousVide/configs"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, type=Path)
-    ap.add_argument("--config", required=True, help="configs/captures/<name>.json 的 name")
+    ap.add_argument("--config", required=True, help="the name in configs/captures/<name>.json")
     ap.add_argument("--stride", type=int, default=1,
-                    help="每隔幾幀掃一次（>1 只用於快速預覽，判定會失準）")
+                    help="scan every Nth frame (>1 only for a quick preview; the verdict becomes inaccurate)")
     args = ap.parse_args()
 
     cfg = json.loads((CFG / "captures" / f"{args.config}.json").read_text())
@@ -47,20 +47,20 @@ def main():
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
-        raise SystemExit(f"無法開啟 {args.video}")
+        raise SystemExit(f"Cannot open {args.video}")
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    print(f"=== 預檢 {args.video.name} ===")
-    print(f"  {w}x{h}，{total} 幀 @ {fps:.2f} fps = {total/fps:.1f} 秒")
+    print(f"=== Pre-check {args.video.name} ===")
+    print(f"  {w}x{h}, {total} frames @ {fps:.2f} fps = {total/fps:.1f} s")
     if (w, h) != (cam["width"], cam["height"]):
-        print(f"  ✗ 解析度與 config 的 {cam['width']}x{cam['height']} 不符 → 內參無效")
+        print(f"  ✗ Resolution does not match the config's {cam['width']}x{cam['height']} -> intrinsics invalid")
     else:
-        print(f"  ✓ 解析度與 config 一致")
+        print(f"  ✓ Resolution matches the config")
 
-    # 與 extract_frames 相同的偵測器設定
+    # Same detector settings as extract_frames
     d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     det = cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
 
@@ -93,48 +93,48 @@ def main():
         idx += 1
     cap.release()
 
-    print(f"\n=== 依 extract_frames 的分箱結果 ===")
-    print(f"  含 tag（剛好 1 個且 id={mkr_id}）: {n_tag:5d} 幀   需要 >= {Narc}",
+    print(f"\n=== Binning result per extract_frames ===")
+    print(f"  With tag (exactly 1, id={mkr_id})       : {n_tag:5d} frames   need >= {Narc}",
           "✓" if n_tag >= Narc else "✗")
-    print(f"  不含 tag                        : {n_empty:5d} 幀   需要 >= {need_empty}",
+    print(f"  Without tag                      : {n_empty:5d} frames   need >= {need_empty}",
           "✓" if n_empty >= need_empty else "✗")
     if n_multi:
-        print(f"  ⚠ 偵測到 2 個以上 marker 的幀   : {n_multi:5d} 幀（反射？這些幀兩邊都不算數）")
+        print(f"  ⚠ Frames with 2+ markers         : {n_multi:5d} frames (reflections? these frames count for neither side)")
     if n_wrongid:
-        print(f"  ⚠ 偵測到錯誤 id 的幀            : {n_wrongid:5d} 幀")
+        print(f"  ⚠ Frames with a wrong id         : {n_wrongid:5d} frames")
 
     ok = n_tag >= Narc and n_empty >= need_empty
 
     if tag_px:
         a = np.array(tag_px)
-        print(f"\n=== 含 tag 幀的品質 ===")
-        print(f"  marker 邊長像素: 中位數 {np.median(a):.0f} px"
-              f"（最小 {a.min():.0f} / 最大 {a.max():.0f}）")
+        print(f"\n=== Quality of frames with the tag ===")
+        print(f"  Marker side length in pixels: median {np.median(a):.0f} px"
+              f" (min {a.min():.0f} / max {a.max():.0f})")
         n_good = int((a >= 100).sum())
-        print(f"  >= 100 px 的幀: {n_good} 幀"
-              f"（姿態解可靠所需；只要 >= {Narc} 就夠）",
+        print(f"  Frames >= 100 px: {n_good} frames"
+              f" (needed for a reliable pose solution; >= {Narc} is enough)",
               "✓" if n_good >= Narc else "✗")
         est_d = cam["intrinsics_matrix"][0][0] * ext["marker_length"] / np.median(a)
-        print(f"  由中位數推估拍攝距離約 {est_d:.2f} m")
+        print(f"  Camera distance estimated from the median: about {est_d:.2f} m")
 
         tt = np.array(tag_times)
-        print(f"  出現時段: {tt.min():.1f}s ~ {tt.max():.1f}s"
-              f"（影片長 {total/fps:.1f}s）")
-        # 視角是否分散：用 marker 像素大小的變異當粗略代理
-        print(f"  邊長變異係數 {a.std()/a.mean()*100:.0f}%"
-              f"（越大代表距離/角度越分散，單一視角的方形標記有姿態歧義）")
+        print(f"  Visible from: {tt.min():.1f}s ~ {tt.max():.1f}s"
+              f" (video length {total/fps:.1f}s)")
+        # Are the viewpoints spread out: use the variation of the marker pixel size as a rough proxy
+        print(f"  Side-length coefficient of variation {a.std()/a.mean()*100:.0f}%"
+              f" (larger means more varied distances/angles; a square marker seen from a single viewpoint has pose ambiguity)")
 
     print()
     if ok:
-        print("✅ 預檢通過，可以進第 6 章建圖")
+        print("✅ Pre-check passed, ready for the chapter 6 reconstruction")
     else:
-        print("❌ 預檢未通過，直接建圖必定失敗。重拍或調整 config：")
+        print("❌ Pre-check failed; reconstructing now will certainly fail. Re-shoot or adjust the config:")
         if n_tag < Narc:
-            print(f"   - 含 tag 的幀只有 {n_tag}，把 num_marked 降到 <= {n_tag}，"
-                  f"或重拍時多繞 tag 拍幾秒")
+            print(f"   - Only {n_tag} frames with the tag; lower num_marked to <= {n_tag}, "
+                  f"or when re-shooting circle the tag for a few more seconds")
         if n_empty < need_empty:
-            print(f"   - 不含 tag 的幀只有 {n_empty}，把 num_images 降到 <= {n_empty + Narc}，"
-                  f"或重拍時讓 tag 離開畫面久一點")
+            print(f"   - Only {n_empty} frames without the tag; lower num_images to <= {n_empty + Narc}, "
+                  f"or when re-shooting keep the tag out of frame for longer")
 
 
 if __name__ == "__main__":

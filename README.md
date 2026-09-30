@@ -13,25 +13,24 @@ They share scene formats and vehicle configs, but **nobody has connected them be
 
 Project background, rationale, and known limitations of this approach are in [`CLAUDE.md`](CLAUDE.md). Read that first if you intend to reuse this.
 
-> **Language note.** This README is in English. The chapter-by-chapter implementation notes in [`notes/`](notes/) are in Traditional Chinese — they carry the reasoning behind every deviation from the upstream instructions, so they are worth translating if you get stuck.
-
 ---
 
-## Example scene: `scene04`
+## Example scenes
 
-A tree-lined outdoor plaza, reconstructed from a single 5-minute iPhone 12 video and **verified metric to within 0.87%**.
+Two complete scenes, each reconstructed from a single hand-held iPhone 12 video and checked against a tape measure.
 
-![scene map](scenes/scene04/figures/scene_map.png)
+<img src="scenes/scene04/figures/scene_map.png" width="49%"> <img src="scenes/sunny_baseball_field/figures/scene_map.png" width="49%">
 
-| | |
-|---|---|
-| Box stack measured in the point cloud | **172.5 cm** |
-| Same stack measured with a tape | **171.0 cm** |
-| **Error** | **+0.87%** (threshold: < 2%) |
-| Ground plane tilt | 1.14° from vertical |
-| Ground flatness, RMS over 30 m | 5.5 mm |
+| | [`scene04`](scenes/scene04/README.md) | [`sunny_baseball_field`](scenes/sunny_baseball_field/README.md) |
+|---|---|---|
+| Place | Tree-lined outdoor plaza | Grass baseball field, sunny day |
+| Video | 5 min | 5.7 min (first 16 s skipped: camera operator's shadow) |
+| Scale check | Box stack 172.5 cm vs tape 171.0 cm: **+0.87%** | Independent close-range tag cross-check: **0.65%**; box stack 170.7 cm vs tape 171.0 cm: −0.19% |
+| Ground tilt, flatness | 1.14°, RMS 5.5 mm over 30 m | 0.85° (after leveling), RMS 5.7 mm |
+| Dense point cloud (in this repo) | 978,285 points, 26 MB | 960,747 points, 25 MB |
+| Trained checkpoint | [`scene04-v1` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/scene04-v1), 1.8 GB | [`sunny_baseball_field-v1` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/sunny_baseball_field-v1), 1.38 GB |
 
-The dense point cloud is checked into this repo — **26 MB, no GPU or setup needed to open it**:
+The dense point clouds are checked into this repo — **no GPU or setup needed to open them**:
 
 ```python
 import open3d as o3d
@@ -39,9 +38,9 @@ o3d.visualization.draw_geometries([
     o3d.io.read_point_cloud("scenes/scene04/scene04_dense.ply")])
 ```
 
-The frame is metric and gravity-aligned: origin at the ArUco tag, +z up, ground at z ≈ −0.02 m, distances in metres.
+Both frames are metric and gravity-aligned: origin at the ArUco tag, +z up, distances in metres.
 
-The 1.8 GB trained checkpoint is on the [Releases page](../../releases) — too large for a git repo. Full details, the file layout it needs, and the three things that break loading are in [`scenes/scene04/README.md`](scenes/scene04/README.md).
+The trained checkpoints are too large for a git repo, so each one is attached to a GitHub release (linked above). How to download and load them, the file layout they need, and the three things that break loading are in each scene's README.
 
 ---
 
@@ -49,10 +48,10 @@ The 1.8 GB trained checkpoint is on the [Releases page](../../releases) — too 
 
 | | |
 |---|---|
-| [`tools/`](tools/) | 14 scripts — calibration, ArUco, frame extraction, mapping, scale verification, export, evaluation, dynamics checks |
-| [`notes/`](notes/) | Chapter-by-chapter implementation records (Traditional Chinese), including every deviation from upstream and why |
+| [`tools/`](tools/) | 18 scripts — camera calibration, ArUco, capture pre-check, frame extraction and mapping, intrinsics hand-over, scale verification, export, evaluation, dynamics checks |
+| [`notes/`](notes/) | Chapter-by-chapter implementation records, including every deviation from upstream and why |
 | [`configs/`](configs/) | Camera intrinsics and capture configs |
-| [`scenes/scene04/`](scenes/scene04/) | A complete, scale-verified example scene |
+| [`scenes/`](scenes/) | Two complete, scale-verified example scenes |
 | [`CLAUDE.md`](CLAUDE.md) | Project goals, constraints, expectation management |
 
 **Not in this repo:** the upstream repos, capture videos, extracted images, SfM intermediates, and training checkpoints — about 49 GB in total. All of it is either downloadable or reproducible. Each section below says how.
@@ -227,7 +226,7 @@ SousVide's install instructions tell you to build acados. **Skip it.** acados is
 
 ### Put the capture configs where the tools expect them
 
-`tools/build_gsplat.py` reads configs from `repos/SousVide/configs/`:
+`tools/build_gsplat.py` reads configs from `repos/SousVide/configs/`. Copy the example configs there (the tools in section 4 write new configs there directly):
 
 ```bash
 cd <repo root>
@@ -279,67 +278,110 @@ ffmpeg -version | head -1
 
 ---
 
-## 4. Building a scene
+## 4. Building your own scene
 
-### 4.1 Camera calibration (once per phone)
+The complete procedure for a new scene, in order. Replace `<phone>`, `<scene>` and `<config>` with your own names — for example `pixel8`, `lab01` and `pixel8_lab01`. Run everything from the repo root with `droneenv` active. The shell scripts find conda through `$CONDA_EXE`, which `conda init` sets; if they cannot find it, run `export CONDA_BASE=/path/to/your/conda` first.
 
-Record a video of a printed checkerboard from many angles and distances.
+| Step | What you do | Result |
+|---|---|---|
+| 4.1 | Calibrate the phone camera with a checkerboard (once per phone) | `repos/SousVide/configs/camera/<phone>.json` |
+| 4.2 | Print the ArUco tag, create the scene's capture config | `repos/SousVide/configs/captures/<config>.json` |
+| 4.3 | Film the scene | `repos/SousVide/gsplats/capture/<scene>.MOV` |
+| 4.4 | Run frames, SfM, check | camera poses and COLMAP's own intrinsics |
+| 4.5 | Copy COLMAP's intrinsics into the config | config matches the SfM |
+| 4.6 | Run scale, train, export, verify | metric 3DGS scene and dense point cloud |
+| 4.7 | Measure something with a tape | scale error < 2% |
+| 4.8 | Prepare the point cloud for policy training | downsampled `.ply` |
+
+### 4.1 Calibrate the phone camera (once per phone)
+
+Camera **intrinsics** are the numbers that describe the lens: the focal length in pixels (`fx`, `fy`), the image center (`cx`, `cy`) and the lens distortion. The metric scale depends directly on `fx`: an `fx` that is 2% too large makes the whole scene 2% too large, and nothing reports an error. This step gives a first estimate and a reference. Step 4.5 later replaces it with values estimated from the scene video itself.
+
+**Record the calibration video in exactly the video mode you will use for your scenes.** The intrinsics are only valid for that mode:
+
+- The **1x wide lens**. Never the 0.5x ultra-wide (it is a different physical lens), and no zoom.
+- The same orientation (portrait or landscape), resolution and frame rate as the scene videos, e.g. 1080p at 30 fps.
+- On iPhone: Settings → Camera → Formats → **Most Compatible** (H.264). OpenCV may not be able to read HEVC.
+- Copy the file to the computer **without re-encoding** (for example over a USB cable). The first calibration attempt for this repo arrived re-encoded at 2.1 Mbps instead of about 16 Mbps and was unusable.
+
+**Print and film the checkerboard:**
 
 ```bash
-python tools/make_checkerboard.py                 # printable PDF
-python tools/calibrate_camera.py --video captures/<video>.MOV --name <phone>
+python tools/make_checkerboard.py      # writes captures/checkerboard_9x6_A4.pdf (9x6 inner corners)
 ```
 
-Output lands in `configs/camera/<phone>.json`.
+- Print the PDF at 100%. The exact square size does not matter, but the squares must stay square: the page carries a horizontal and a vertical ruler line, nominally 100 mm each, and the two must come out the same length.
+- Glue the print onto a flat, rigid board. A wavy sheet taped to a wall gave a bad calibration here.
+- Film it from many angles and distances, and **sweep it through every part of the image, especially the corners and edges**. If all the corners sit in the middle of the image, the distortion near the edges is left undetermined.
 
-**Reprojection error must be under 0.5 px — but see section 6.1 before trusting the focal length.** A low reprojection error does not mean an accurate `fx`, and `fx` is what sets your scene's scale.
+```bash
+python tools/calibrate_camera.py --video <path/to/checkerboard.MOV> --name <phone>
+```
 
-### 4.2 ArUco tag and capture config
+It writes `repos/SousVide/configs/camera/<phone>.json` and prints these checks:
+
+| Check | Pass | What it catches |
+|---|---|---|
+| Mean reprojection error | < 0.5 px | the lens model cannot explain the detected corners |
+| Share of corners in the emptiest cell of a 3×3 grid over the image | ≥ 3% | corners bunched in the middle; distortion undetermined near the edges |
+| (a) Distortion shift at the image corner | < 25 px | an ill-conditioned distortion solution |
+| **(b) Change in `fx` when the distortion model is changed** | **< 1%** | **the one that matters for scale** — `fx` uncertainty turns directly into scale error |
+
+If a check fails, the file is written as `<phone>.REJECTED.json` so that it cannot be used by accident. Re-record rather than override it. (`--force` writes the normal name anyway. The iPhone 12 calibration in this repo was accepted that way with only 1.9% in its emptiest cell — and step 4.5 later showed its `fx` to be about 2% too large.)
+
+**A low reprojection error does not mean an accurate `fx`.** In a synthetic test, a calibration with one of the nine cells empty had a reprojection error of only 0.037 px, yet its `fx` was 1.1% off. The full story is in [`notes/03-calibration.md`](notes/03-calibration.md).
+
+### 4.2 Print the ArUco tag and create the scene's capture config
 
 The ArUco tag is a printed black-and-white square placed in the scene. **It is the only thing in the entire pipeline that knows how long a metre is.**
 
 ```bash
-python tools/make_aruco.py --page 210 297        # A4; use 297 420 for A3
-
-python tools/make_capture_config.py \
-  --name <config-name> \
-  --marker-length 0.144 \
-  --num-images 600
+python tools/make_aruco.py --page 210 297        # A4; use 297 420 for A3. Writes to captures/
 ```
 
-⚠️ **`--marker-length` must be the measured side of the printed black square, in metres — not the design value.** Printer scaling shifts this by a few percent, and that error passes straight through to your scene scale.
+- ⚠️ **Measure the printed black square with a ruler** — the full side of the black area, including its outer black border but not the white margin — and use that value, in metres. Do not use the design value: printer scaling shifts it by a few percent, and that error passes straight through to your scene scale.
+- Glue it flat onto a rigid board.
 
-### 4.3 Capture
-
-Hand-hold the phone and walk the scene:
-
-- The ArUco tag must be clearly visible in **at least `num_marked` frames** (default 20)
-- **Walk a loop, and vary your height** — crouch, stand, reach up. A straight-line path produces a degenerate reconstruction that passes every SfM check and still fails on scale (see `notes/07-scene-experiments.md`)
-- Move slowly; motion blur causes SfM registration failures
-- Keep the camera pointed at things with texture, not blank walls
-
-Put the video here, with the scene name in the filename, matching exactly one file:
-
-```
-repos/SousVide/gsplats/capture/<something-with-scenename>.MOV
-```
-
-Then pre-check it:
+Each scene gets **its own capture config**, because step 4.5 writes that scene's own intrinsics into it. `make_capture_config.py --name <config>` reads the camera file with the **same name**, so copy your phone calibration to that name first:
 
 ```bash
-python tools/preflight_capture.py --video <video> --config <config-name>
+cp repos/SousVide/configs/camera/<phone>.json repos/SousVide/configs/camera/<config>.json
+python tools/make_capture_config.py --name <config> --marker-length 0.144 --num-images 600
 ```
 
-### 4.4 Run the pipeline
+This writes `repos/SousVide/configs/captures/<config>.json`, which has a `camera` block (the intrinsics) and an `extractor` block (`num_images`, `num_marked`, `marker_length`, `marker_id`).
+
+Optional: if the start of your video will show you or your shadow, add `"skip_start_sec": <seconds>` to the `extractor` block. Frames before that time are never used.
+
+To keep a config in git, copy it to `configs/captures/` (and its camera file to `configs/camera/`). That is where the configs of the two example scenes are.
+
+### 4.3 Capture the scene
+
+**Place the tag flat on level ground**, near the middle of the area you want to fly in. The tag defines the origin and the up direction (+z) of the scene, so a tag tilted by a few degrees tilts the whole scene. (That can be corrected in step 4.6 with `--level-ground`.)
+
+**Record hand-held, in the same video mode as the calibration video:**
+
+- **Film the tag from close up**, at several points along the way: at least 4 frames in which the tag is **at least 100 px wide** in the image. For the 14.4 cm tag and the iPhone 12 used here, that means the camera within about 2.4 m of the tag (distance ≈ `fx` × tag side ÷ 100 px). By default the scale solve uses only these close-range frames (`--min-tag-px 100`), because distant tags bias the scale.
+- The tag must be clearly visible in at least `num_marked` frames (default 20) in total.
+- **Keep yourself and your shadow out of the frame**, above all in the close-range tag shots. A moving shadow turns into stains or floaters in the 3DGS. (`sunny_baseball_field` had to drop its first 16 s for this reason, and most of its close-range tag shots with them.)
+- **Walk a loop, and vary your height** — crouch, stand, reach up. A straight-line path produces a degenerate reconstruction that passes every SfM check and still fails on scale (see [`notes/07-scene-experiments.md`](notes/07-scene-experiments.md)).
+- Move slowly; motion blur causes SfM registration failures.
+- Keep the camera pointed at things with texture, not blank walls.
+
+**Name the file** `<scene>.MOV` or `<scene>_<anything>.MOV` (for example `lab01_IMG_1234.MOV`) and put it in `repos/SousVide/gsplats/capture/`. Exactly one file there may match the scene name.
+
+**Pre-check it** before spending hours on SfM:
 
 ```bash
-./tools/run_pipeline.sh --scene scene05 --config iphone12_600
+python tools/preflight_capture.py --video repos/SousVide/gsplats/capture/<scene>.MOV --config <config>
 ```
 
-That runs every stage in order. You can also run a subset:
+It sorts every frame with the same logic the pipeline uses, and tells you whether there are enough frames with and without the tag.
+
+### 4.4 Run the first half: frames, SfM, check
 
 ```bash
-./tools/run_pipeline.sh --scene scene05 --config iphone12_600 --stages scale,train,export
+./tools/run_pipeline.sh --scene <scene> --config <config> --stages frames,sfm,check
 ```
 
 | Stage | What it does | Time for 600 images |
@@ -354,6 +396,10 @@ That runs every stage in order. You can also run a subset:
 
 **`check` is a separate stage on purpose.** If the tag-bearing frames are not all registered, the downstream step throws `Mismatched number of aruco and sfm transforms` — and by then SfM has already burned hours.
 
+`--select sharp` makes the `frames` stage take the sharpest frame within each sampling bin, instead of the upstream `uniform` sampling spread over time.
+
+Running `./tools/run_pipeline.sh --scene <scene> --config <config>` without `--stages` runs all seven stages in one go. For a new scene, don't: it skips step 4.5, so the scale solve would use your checkerboard `fx`.
+
 **SfM cost is quadratic in image count.** Exhaustive matching compares every pair:
 
 | Images | Pairs | SfM time |
@@ -365,17 +411,46 @@ That runs every stage in order. You can also run a subset:
 
 More images is not better past a point. On the same video with the same path, 300 → 400 images changed eval PSNR from 21.12 to 20.86. **Trajectory shape dominates; image count does not.**
 
-### 4.5 Verify the scale — do not skip this
+### 4.5 Put the SfM's own intrinsics into the config — do not skip this
+
+During SfM, COLMAP self-calibrates the camera from your scene video, and both SfM and 3DGS training use those values. The scale solve, however, reads the `camera` block of your config. If the two disagree, the scene scale is off by the same percentage, silently (section 6.1). Copy them over:
 
 ```bash
-./tools/open_pointcloud.sh scene05
+python tools/use_sfm_intrinsics.py --scene <scene> --config <config> --dry-run   # only show the difference
+python tools/use_sfm_intrinsics.py --scene <scene> --config <config>
 ```
 
-Shift + left-click two points, press Q, and the distance is printed. **Measure something you can physically reach with a tape. The error must be under 2%.**
+It prints how far your config's `fx` was from COLMAP's. For the iPhone 12 used here, the checkerboard `fx` was 2.1–2.3% larger than COLMAP's in both example scenes; left in place, it would have made each scene about 2% too large. Treat a much larger difference as a sign that the calibration or the SfM went wrong.
+
+It rewrites the `camera` block of `repos/SousVide/configs/captures/<config>.json`, and also `repos/SousVide/configs/camera/<config>.json` and the copies under `configs/` if they exist. The `extractor` block is left as it is.
+
+### 4.6 Run the second half: scale, train, export, verify
+
+```bash
+./tools/run_pipeline.sh --scene <scene> --config <config> --stages scale,train,export,verify
+```
+
+Options for the `scale` stage (they can be combined):
+
+| Option | Default | What it does, and when to use it |
+|---|---|---|
+| `--min-tag-px N` | `100` | Only tag observations at least N px wide are used for the scale solve; if fewer than 4 qualify, the 4 largest are used. `0` uses every observation, as upstream does (scene04 was built that way) |
+| `--tag-rule present` | `exact` | For textured ground such as grass, where the detector reports small fake tags. `exact` (upstream) drops every image with more than one detection; `present` keeps an image whenever the real id is in it. The `scale` stage prints how many images had extra detections |
+| `--level-ground R` | off | For a tag that was not lying flat: after the scale solve, the scene is rotated so that the ground within R m is horizontal (scale and origin unchanged). Use it when `verify` flags the floor as not level (tilt of 3° or more) on ground you know is level. `sunny_baseball_field` used `12` |
+
+`--tag-rule` and `--level-ground` change `transforms.json`, which training reads. After changing either, re-run all four stages.
+
+### 4.7 Verify the scale — do not skip this
+
+```bash
+./tools/open_pointcloud.sh <scene>
+```
+
+Shift + left-click two points, press Q, and the distance is printed. **Measure something you can physically reach with a tape. The error must be under 2%.** Both example scenes have a stack of cardboard boxes of known height next to the tag for exactly this.
 
 Getting scale wrong does not raise an error. It silently corrupts the dynamics, the 0.5 m obstacle threshold, and the reward.
 
-### 4.6 Prepare the cloud for training
+### 4.8 Prepare the cloud for policy training
 
 ```bash
 python tools/prepare_pointcloud.py     # outlier removal, voxel downsample, validation
@@ -384,6 +459,8 @@ python tools/fly_orbit_preview.py      # fly a real simulated orbit, render the 
 ```
 
 Downsampling is not optional: grad_nav's `ObstacleDistanceCalculator` builds four `[num_envs, num_points, 3]` tensors at once. At 128 environments, scene04's 978k points would need about 4 GB on top of the Gaussians. Under 100k points keeps it near 0.4 GB.
+
+For large outdoor scenes, `prepare_pointcloud.py` has two optional filters (both off by default): `--crop-center X Y --crop-radius R` keeps only the area around the task, and `--min-neighbors N --neighbor-radius 0.10` removes isolated 3DGS floaters, such as those left along the capture path. See `--help`.
 
 ---
 
@@ -468,6 +545,8 @@ print("OK" if abs(d) < 0.01 else "MISMATCH — this becomes your scale error")
 EOF
 ```
 
+[`tools/use_sfm_intrinsics.py`](tools/use_sfm_intrinsics.py) (step 4.5) prints the same comparison and copies COLMAP's values into the config.
+
 When they disagree, **prefer COLMAP's**. It is self-calibrated from hundreds of images across the whole scene; a checkerboard video with poor corner coverage is far more weakly constrained, and its low reprojection error will not reveal the problem.
 
 ### 6.2 Silent failures to watch for
@@ -475,6 +554,10 @@ When they disagree, **prefer COLMAP's**. It is self-calibrated from hundreds of 
 - **`orientation-method`, `center-method`, `auto-scale-poses`.** Defaults are `up`, `poses`, `True` — **all three destroy metric scale.** They belong to the `nerfstudio-data` dataparser and must appear *after* it on the command line. `build_gsplat.py` already sets them to `none`, `none`, `False`.
 - **Every SfM metric can be green while scale is wrong.** scene02 registered 100% of images at 1.398 px and still had 106.7% ArUco scale dispersion, because the camera walked a straight line. Only an external metric reference catches this.
 - **Laplacian variance is not a blur metric.** It responds to image content too. In scene02 the lowest-scoring frames were perfectly sharp photographs of a blank wall. Only compare within one scene.
+- **A tag that is not lying flat tilts the whole scene.** The tag's normal becomes +z. In `sunny_baseball_field` the tag board, resting on grass, tilted the scene by about 3.5° — about 60 cm of ground-height change over 10 m of flight. `verify` flags tilts of 3° or more; `--level-ground` fixes them.
+- **Distant tag observations bias the scale.** At twenty or thirty pixels, one or two pixels of corner error is several percent of distance, and the error is not zero-mean. On an earlier capture of the baseball field, all 20 tag observations gave a +2.66% scale error and the 4 closest gave +0.40%. Hence `--min-tag-px 100`.
+- **Fake tags on grass.** Grass texture is detected as small ArUco tags with other ids. The upstream rule then throws away the whole image — often one of your best close-range views of the real tag. Use `--tag-rule present`.
+- **Your own shadow.** A moving shadow in the frames becomes stains or floaters in the 3DGS. Keep it out of the video, or cut the start with `skip_start_sec`.
 
 ### 6.3 grad_nav hardcoded values
 
@@ -504,7 +587,9 @@ Not implementation defects — properties of the method:
 
 ## Implementation notes
 
-`notes/` holds the record of what was actually done, including every deviation from the upstream instructions and the reasoning. **Written in Traditional Chinese**, and more useful than this README when something breaks.
+`notes/` holds the record of what was actually done, including every deviation from the upstream instructions and the reasoning. More useful than this README when something breaks.
+
+The notes and some tool messages refer to "chapter N" of the original plan (`implement.md`, not published). The notes are numbered the same way: chapter 3 is `notes/03-calibration.md`, and so on.
 
 | File | Topic |
 |---|---|

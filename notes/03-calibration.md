@@ -1,122 +1,122 @@
-# 第 3 章 相機內參標定（iPhone 12）
+# Chapter 3 Camera intrinsics calibration (iPhone 12)
 
-日期：2026-08-13
-產出：`repos/SousVide/configs/camera/iphone12.json`
+Date: 2026-08-13
+Output: `repos/SousVide/configs/camera/iphone12.json`
 
-## 上游是壞的，本章改用自寫工具
+## Upstream is broken; this chapter uses a self-written tool instead
 
-`figs.render.capture_calibration.camera_calibration()` **無法使用**，三個獨立問題：
+`figs.render.capture_calibration.camera_calibration()` **cannot be used**, due to three independent problems:
 
-1. 第 38 行呼叫 `ch.extract_frames(...)`，但 `figs/utilities/capture_helper.py`
-   **沒有這個函式** → `AttributeError`。同名函式在 `capture_generation.py`，
-   簽章與用途都不同（寫檔而非回傳陣列）
-2. 預設路徑算錯：`Path(__file__).parent×3/'gsplats'` → `FiGS/src/gsplats`（不存在）。
-   `generate_gsplat` 用的是 `parent×5`，才對到 `SousVide/gsplats`
-3. **物點索引順序寫反**：`np.mgrid[0:rows, 0:cols].T`。
-   `findChessboardCorners(patternSize=(cols,rows))` 回傳的是每列 cols 個、
-   共 rows 列的 row-major 順序，物點必須是 `mgrid[0:cols, 0:rows].T`
-   （與 OpenCV 官方教學一致）。用錯順序會標出完全錯誤的內參——
-   合成測試實測 fx 由真值 1310 變成 **58**
+1. Line 38 calls `ch.extract_frames(...)`, but `figs/utilities/capture_helper.py`
+   **has no such function** -> `AttributeError`. A function with the same name exists in `capture_generation.py`,
+   with a different signature and purpose (it writes files instead of returning arrays)
+2. The default path is computed wrong: `Path(__file__).parent×3/'gsplats'` -> `FiGS/src/gsplats` (does not exist).
+   `generate_gsplat` uses `parent×5`, which correctly reaches `SousVide/gsplats`
+3. **The object-point index order is reversed**: `np.mgrid[0:rows, 0:cols].T`.
+   `findChessboardCorners(patternSize=(cols,rows))` returns the corners in row-major order (rows rows
+   of cols corners each), so the object points must be `mgrid[0:cols, 0:rows].T`
+   (consistent with the official OpenCV tutorial). The wrong order produces completely wrong intrinsics --
+   in a synthetic test, fx went from the true value 1310 to **58**
 
-替代工具：`tools/calibrate_camera.py`，已用已知內參的合成影片端到端驗證
-（9/9 覆蓋時 fx 誤差 0.10%）。
+Replacement tool: `tools/calibrate_camera.py`, verified end to end on a synthetic video with known intrinsics
+(fx error 0.10% at 9/9 coverage).
 
-## 兩個經實測確認、可以放心的事
+## Two things confirmed by testing that are safe to rely on
 
-**`square_size` 不影響標定結果。** 25.0 / 3.0 / 0.025 三種值算出的內參與
-畸變係數到小數點後 4 位相同。縮放物點只會等比縮放外參的平移向量。
-→ 棋盤格不需要精確列印，也不需要精確量測方格邊長。
-實際列印出來是 22 mm（標稱 24 mm，91.7%），無影響。
-唯一要防的是**非等比**縮放，會讓 fx/fy 出現假差異。
+**`square_size` does not affect the calibration result.** With 25.0 / 3.0 / 0.025 the computed intrinsics and
+distortion coefficients are identical to 4 decimal places. Scaling the object points only scales the translation vectors of the extrinsics proportionally.
+-> The checkerboard does not need to be printed precisely, and the square side length does not need to be measured precisely.
+The actual print came out at 22 mm (nominal 24 mm, 91.7%), with no impact.
+The only thing to guard against is **non-uniform** scaling, which creates a spurious difference between fx and fy.
 
-**重投影誤差低不代表內參準。** 合成測試中 8/9 覆蓋時誤差僅 0.037 px
-（遠低於 0.5 標準），fx 卻偏離真值 1.1%；補到 9/9 後降到 0.10%。
-誤差只說明模型能解釋拍到的點，不保證那些點足以約束參數。
+**A low reprojection error does not mean accurate intrinsics.** In the synthetic test at 8/9 coverage the error was only 0.037 px
+(far below the 0.5 px criterion), yet fx was 1.1% off the true value; after filling in to 9/9 it dropped to 0.10%.
+The error only says the model can explain the points captured, not that those points are enough to constrain the parameters.
 
-## 第一次錄影（已棄用）
+## First recording (discarded)
 
-`calibrate.mp4`：720×1280、**2.1 Mbps**（原生 1080p30 約 17 Mbps
-→ 傳輸途中被重新編碼壓縮）、棋盤格用膠帶貼牆且紙面波浪起伏。
+`calibrate.mp4`: 720×1280, **2.1 Mbps** (native 1080p30 is about 17 Mbps
+-> it was re-encoded and compressed in transit), checkerboard taped to a wall with a wavy paper surface.
 
-結果：角點 67% 擠在畫面正中央，最少的一區僅 **0.2%**。
-畸變成為病態解（`k1=+0.184, k2=-1.011` 一正一負互相抵消），
-角落徑向位移 **87 px**，換畸變模型後 **fx 變動 2.0%**。
+Result: 67% of the corners were crowded in the center of the frame; the emptiest region had only **0.2%**.
+The distortion became an ill-conditioned solution (`k1=+0.184, k2=-1.011`, one positive and one negative cancelling each other),
+the radial displacement at the corners was **87 px**, and switching the distortion model **changed fx by 2.0%**.
 
-⚠ 交叉驗證（奇/偶幀分開標定）顯示兩者差 0.01%，**高度可重現但不準**——
-兩半共享同樣的取樣偏差，這個測試偵測不到覆蓋不足。不要用它當作驗收。
+⚠ Cross-validation (calibrating odd/even frames separately) showed only a 0.01% difference: **highly reproducible but not accurate** --
+both halves share the same sampling bias, so this test cannot detect insufficient coverage. Do not use it as an acceptance check.
 
-## 第二次錄影（採用）
+## Second recording (adopted)
 
-`IMG_2119.MOV`：1920×1080 容器 + `rotation=-90` 中繼資料、**15.6 Mbps 原生**、
-棋盤格貼在硬紙板上。
+`IMG_2119.MOV`: 1920×1080 container + `rotation=-90` metadata, **15.6 Mbps native**,
+checkerboard mounted on stiff cardboard.
 
-### ⚠ 旋轉中繼資料
+### ⚠ Rotation metadata
 
-容器是 1920×1080，但 OpenCV 的 `CAP_PROP_ORIENTATION_AUTO=1` 會自動轉正，
-實際解碼出 **1080×1920 直式**。FiGS 的 `extract_frames` 用同一個
-`cv2.VideoCapture`，**會做完全相同的自動旋轉**，所以 config 的
-`height=1920 / width=1080` 與後續處理一致。
+The container is 1920×1080, but OpenCV's `CAP_PROP_ORIENTATION_AUTO=1` automatically rotates it upright,
+so it actually decodes as **1080×1920 portrait**. FiGS's `extract_frames` uses the same
+`cv2.VideoCapture` and **applies exactly the same automatic rotation**, so the config's
+`height=1920 / width=1080` is consistent with later processing.
 
-### 結果
+### Result
 
 ```
-影像尺寸 1080 x 1920
+Image size 1080 x 1920
 fx=1702.2846  fy=1708.6379
-cx=544.8192   cy=949.0888      (畫面中心 540.0, 960.0)
-畸變 k1=+0.220034 k2=-0.716124 p1=-0.000202 p2=+0.000909
+cx=544.8192   cy=949.0888      (image center 540.0, 960.0)
+Distortion k1=+0.220034 k2=-0.716124 p1=-0.000202 p2=+0.000909
 Mean Reprojection Error: 0.0783 px
 ```
 
-| 檢查 | 第一次 | 第二次 | 門檻 | |
+| Check | First | Second | Threshold | |
 |---|---|---|---|---|
-| 重投影誤差 | 0.041 px | 0.078 px | < 0.5 | ✓ |
-| 角點最少分區佔比 | 0.2% | 1.9% | >= 3% | ✗ |
-| (a) 角落徑向位移 | 87 px | 33 px | < 25 px | ✗ |
-| **(b) 換畸變模型後 fx 變動** | **2.0%** | **0.3%** | < 1% | **✓** |
+| Reprojection error | 0.041 px | 0.078 px | < 0.5 | ✓ |
+| Share of corners in the emptiest region | 0.2% | 1.9% | >= 3% | ✗ |
+| (a) Radial displacement at corners | 87 px | 33 px | < 25 px | ✗ |
+| **(b) fx change after switching distortion model** | **2.0%** | **0.3%** | < 1% | **✓** |
 
-**(b) 是真正決定尺度的指標**（solvePnP 的距離解正比於焦距，
-fx 的不確定性直接轉成場景尺度誤差），從 2.0% 降到 0.3%，
-第 7 章的 2% 尺度預算得以保留。
+**(b) is the metric that really determines scale** (solvePnP's distance solution is proportional to the focal length,
+so the uncertainty in fx turns directly into scene scale error). It dropped from 2.0% to 0.3%,
+so the 2% scale budget of chapter 7 is preserved.
 
-(a) 的 25 px 是我設的經驗門檻；33 px 對應角落 3.1% 徑向偏離，
-對手機廣角鏡其實算合理範圍，屬邊緣個案。
+The 25 px for (a) is an empirical threshold I set; 33 px corresponds to a 3.1% radial deviation at the corners,
+which is actually within a reasonable range for a phone wide-angle lens; it is a borderline case.
 
-### 獨立合理性檢查（與官方隨附設定檔對照）
+### Independent sanity check (compared with the official bundled config files)
 
 ```
-                   宣告 WxH        fx        fy       cx       cy   fx/短邊   主點
-iphone15pro(官方)  1080x1920    1276.5    1280.0    960.0    540.0   1.182   **不一致**
-pixel8pro(官方)    1080x1920    1761.0    1798.0    540.0    960.0   1.631   一致
-iphone12(你的)     1080x1920    1702.3    1708.6    544.8    949.1   1.576   一致
+                       declared WxH      fx        fy       cx       cy   fx/short side   principal point
+iphone15pro(official)  1080x1920     1276.5    1280.0    960.0    540.0           1.182   **inconsistent**
+pixel8pro(official)    1080x1920     1761.0    1798.0    540.0    960.0           1.631   consistent
+iphone12(yours)        1080x1920     1702.3    1708.6    544.8    949.1           1.576   consistent
 ```
 
-- `fx/短邊` 1.576 與 pixel8pro 的 1.631 同一量級，合理
-- 主點與畫面中心一致（官方的 `iphone15pro.json` 反而不一致，
-  cx=960/cy=540 對應的是橫式 1920×1080，那份檔案的 height/width 標反了）
-- fx 與 fy 相差 0.37%，無非等比縮放
-- 視角：短邊 35.2°、長邊 58.7°
+- `fx/short side` 1.576 is the same order of magnitude as pixel8pro's 1.631, reasonable
+- The principal point agrees with the image center (the official `iphone15pro.json` does not:
+  cx=960/cy=540 corresponds to landscape 1920×1080, so that file has height/width swapped)
+- fx and fy differ by 0.37%, no non-uniform scaling
+- Field of view: 35.2° on the short side, 58.7° on the long side
 
-## 使用者決定
+## User decision
 
-角點分佈（1.9% vs 3%）與 (a) 兩項未達門檻，使用者評估「棋盤格已貼到最平，
-其餘當作誤差接受，目前是極限」，決定採用。
-以 `--force` 產出正式檔名（該旗標為此次新增，檢查結果仍完整印出）。
+Corner distribution (1.9% vs 3%) and (a) did not meet their thresholds. The user judged that "the checkerboard is already as flat as it can get,
+the rest is accepted as error, this is the limit for now", and decided to adopt it.
+The official file name was produced with `--force` (that flag was added for this occasion; the check results are still printed in full).
 
-**殘餘風險會在第 7 章顯現**：若場景尺度誤差超過 2%，
-內參是第一個要回頭檢查的對象。
+**The residual risk will show up in chapter 7**: if the scene scale error exceeds 2%,
+the intrinsics are the first thing to go back and check.
 
-## 給第 5 章的硬性約束
+## Hard constraints for chapter 5
 
-場景影片必須與標定影片**完全相同的錄影條件**，否則這份內參無效：
+The scene video must use **exactly the same recording conditions** as the calibration video, otherwise these intrinsics are invalid:
 
-- **1x 廣角鏡**（絕不用 0.5x 超廣角，那是另一顆實體鏡頭）
-- **直式手持**（產生 1920×1080 + rotation=-90，OpenCV 讀成 1080×1920）
+- **1x wide-angle lens** (never the 0.5x ultra-wide, which is a different physical lens)
+- **Handheld in portrait** (produces 1920×1080 + rotation=-90, which OpenCV reads as 1080×1920)
 - 1080p / 30 fps
-- **用 USB 線等不會重新編碼的方式傳輸**（第一支影片就是敗在被壓成 2.1 Mbps）
+- **Transfer via USB cable or another method that does not re-encode** (the first video failed precisely because it was compressed to 2.1 Mbps)
 
-## 待辦（第 4 章完成後）
+## To do (after chapter 4 is finished)
 
-`configs/captures/iphone12.json` 尚未建立。它 = 本檔的 camera 區塊
-+ extractor 區塊（`num_images` / `num_marked` / **`marker_length`** / `marker_id`）。
-`marker_length` 必須是印出來的 ArUco **實測邊長**，那是整個場景的尺度基準，
-所以要等第 4 章量完才能組出來。
+`configs/captures/iphone12.json` has not been created yet. It consists of this file's camera block
+plus an extractor block (`num_images` / `num_marked` / **`marker_length`** / `marker_id`).
+`marker_length` must be the **measured side length** of the printed ArUco tag; that is the scale reference for the whole scene,
+so it can only be assembled after chapter 4's measurement.

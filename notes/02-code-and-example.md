@@ -1,130 +1,130 @@
-# 第 2 章 取得程式碼與跑通官方範例
+# Chapter 2 Getting the code and running the official example
 
-日期：2026-08-11
+Date: 2026-08-11
 
-## 2.1 論文（已下載到 refs/）
+## 2.1 Papers (downloaded to refs/)
 
-| 檔案 | 大小 |
+| File | Size |
 |---|---|
 | 2024-12-20-sousvide.pdf | 9.5 MB |
-| 2025-03-06-grad-nav.pdf | 3.1 MB, 8 頁 |
-| 2025-06-16-grad-nav-pp.pdf | 5.6 MB, 7 頁 |
+| 2025-03-06-grad-nav.pdf | 3.1 MB, 8 pages |
+| 2025-06-16-grad-nav-pp.pdf | 5.6 MB, 7 pages |
 
-三個都是有效 PDF，不是錯誤頁。
+All three are valid PDFs, not error pages.
 
-## 2.2 程式碼
+## 2.2 Code
 
 ```
-repos/SousVide/            (含 FiGS submodule)
+repos/SousVide/            (includes the FiGS submodule)
 repos/SousVide/FiGS/Hierarchical-Localization/   (hloc)
-repos/SousVide/FiGS/acados/                      (空目錄，刻意不初始化)
+repos/SousVide/FiGS/acados/                      (empty directory, deliberately not initialized)
 repos/grad_nav/
 ```
 
-**只初始化了 FiGS 與 hloc 兩個 submodule，沒有拉 acados。**
-確認過 FiGS 的 `pyproject.toml` 不依賴 acados，acados 只被
-`simulator.py`、`control/vehicle_rate_mpc.py`、`dynamics/quadcopter_rate_model.py`
-三個檔案 import，全是我們不走的 MPC 路徑。
+**Only the FiGS and hloc submodules were initialized; acados was not pulled.**
+Confirmed that FiGS's `pyproject.toml` does not depend on acados; acados is imported only by the three files
+`simulator.py`, `control/vehicle_rate_mpc.py` and `dynamics/quadcopter_rate_model.py`,
+all on the MPC path we do not use.
 
-FiGS **沒有任何 `__init__.py`**（PEP 420 namespace package），
-所以 `import figs.render.capture_generation` 不會觸發任何父層 import。
-附錄 A 擔心的「import figs 連帶 acados 失敗」不會發生。
+FiGS **has no `__init__.py` at all** (PEP 420 namespace package),
+so `import figs.render.capture_generation` does not trigger any parent-level import.
+The concern in Appendix A (of the original plan, `implement.md`, not published) that "`import figs` fails as a knock-on effect of acados" does not materialize.
 
-安裝的關鍵套件：`hloc 1.5`(editable)、`figs 0.1.0`(editable)、
-`pycolmap 4.1.1`、`kornia 0.8.2`、`lightglue 0.0`。
+Key packages installed: `hloc 1.5`(editable), `figs 0.1.0`(editable),
+`pycolmap 4.1.1`, `kornia 0.8.2`, `lightglue 0.0`.
 
-### ⚠️ opencv 被弄壞了兩次
+### ⚠️ opencv got broken twice
 
-- hloc 的 requirements 要 `opencv-python`（實際裝到 **5.0.0.93**，
-  它要求 numpy>=2，與我們的 numpy 1.26.4 不相容）
-- FiGS 依賴 `albumentations`，後者要 `opencv-python-headless>=4.9.0.80`
+- hloc's requirements want `opencv-python` (it actually installed **5.0.0.93**,
+  which requires numpy>=2 and is incompatible with our numpy 1.26.4)
+- FiGS depends on `albumentations`, which wants `opencv-python-headless>=4.9.0.80`
 
-**三個發行版都寫進同一個 `cv2/` 目錄**，檔案互相覆蓋。而且解除安裝其中
-任何一個都會刪掉共用檔案、留下孤兒目錄。
+**All three distributions write into the same `cv2/` directory**, overwriting each other's files. And uninstalling
+any one of them deletes shared files and leaves an orphaned directory.
 
-處理方式（第 6、9 章若再裝東西要重做一次這個檢查）：
+Fix (redo this check if anything more is installed in chapter 6 or 9):
 
 ```bash
 pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python
-# 確認 site-packages 內 cv2/ 已清空
+# confirm cv2/ inside site-packages has been emptied
 pip install "opencv-contrib-python==4.10.0.84"
 ```
 
-清乾淨後確認：只剩一個 `cv2.abi3.so`、單一 dist-info、`aruco: True`。
+After cleaning up, confirmed: only one `cv2.abi3.so`, a single dist-info, `aruco: True`.
 
-### hloc 可用性（無聲失敗的來源）
+### hloc availability (a source of silent failure)
 
-nerfstudio 的 `hloc_utils.py` 把 hloc 的 import 包在 `try/except ImportError`，
-失敗只是把 `_HAS_HLOC = False`，**不會報錯**。實測結果：
+nerfstudio's `hloc_utils.py` wraps the hloc import in `try/except ImportError`;
+a failure only sets `_HAS_HLOC = False` and **raises no error**. Measured result:
 
 ```
 pycolmap: 4.1.1
 hloc.extract_features / match_features / pairs_from_exhaustive
-     / pairs_from_retrieval / reconstruction  皆 OK
-_HAS_HLOC 會是 True → 第 6 章的 hloc 路徑可用
+     / pairs_from_retrieval / reconstruction  all OK
+_HAS_HLOC will be True -> the hloc path in chapter 6 is usable
 ```
 
-## 2.3 官方範例（手冊驗收方式需替換）
+## 2.3 Official example (the plan's acceptance method had to be replaced)
 
-### 為什麼沒跑 notebook
+### Why the notebook was not run
 
-`notebooks/figs_examples.ipynb` 跑不起來，有兩個獨立原因：
+`notebooks/figs_examples.ipynb` cannot run, for two independent reasons:
 
-1. **cell 4 與 cell 12 走 `VehicleRateMPC` → import acados**，
-   與第 1.8 節「acados 不用編譯」直接衝突。`figs/simulator.py` 也 import acados。
-2. notebook 預設 `capture_name = "button"`，但下載的資料裡
-   `gsplats/capture/` 只有 `backroom.MOV`，沒有 button。
+1. **cells 4 and 12 go through `VehicleRateMPC` -> import acados**,
+   which directly conflicts with section 1.8, "acados does not need to be compiled". `figs/simulator.py` also imports acados.
+2. The notebook defaults to `capture_name = "button"`, but in the downloaded data
+   `gsplats/capture/` only has `backroom.MOV`, no button.
 
-### 改用的驗證方式
+### Verification method used instead
 
-直接用 `figs.render.gsplat.GSplat`——那是本專案真正會用到的渲染路徑
-（grad_nav 的 `utils/gs_local.py` 與它同構），只依賴 nerfstudio/torch/numpy。
-腳本邏輯：載入官方 backroom checkpoint → 取訓練集實際相機位姿 → 渲染 → 存檔 → 目視確認。
+Use `figs.render.gsplat.GSplat` directly -- that is the render path this project will really use
+(grad_nav's `utils/gs_local.py` has the same structure), and it depends only on nerfstudio/torch/numpy.
+Script logic: load the official backroom checkpoint -> take actual camera poses from the training set -> render -> save -> visual check.
 
-⚠️ 座標細節：`render_rgb` 內部做 `Tc2g = Tw2g @ T_c2w`，
-而 `Tw2g = diag(1,-1,-1,1)` 是自逆的。要用資料集位姿渲染必須餵
-`T_c2w = Tw2g @ Tc2g_dataset`，否則畫面上下顛倒。
+⚠️ Coordinate detail: `render_rgb` internally computes `Tc2g = Tw2g @ T_c2w`,
+and `Tw2g = diag(1,-1,-1,1)` is its own inverse. To render with dataset poses you must feed
+`T_c2w = Tw2g @ Tc2g_dataset`, otherwise the image is upside down.
 
-### 結果（通過）
+### Result (passed)
 
 ```
-高斯數量: 535,006      eval_dataset 相機數: 30
-位姿 0/1/2 皆渲染出 (360,640,3) uint8 影像
-亮度 mean 137.1 / 85.4 / 86.7，相異像素值 227 / 241 / 236
+Number of Gaussians: 535,006      eval_dataset cameras: 30
+Poses 0/1/2 all rendered (360,640,3) uint8 images
+Brightness mean 137.1 / 85.4 / 86.7, distinct pixel values 227 / 241 / 236
 ```
 
-目視確認：`notes/ch2_render/backroom_cam0.png` 清楚可見**平放地面的
-ArUco tag**（正是第 4.3 節要求的擺法）；`backroom_cam1.png` 是清晰的
-實驗室場景，家具、櫃子、紙箱都可辨識。**管線本身沒問題。**
+Visual check: `notes/ch2_render/backroom_cam0.png` clearly shows **an ArUco tag lying flat
+on the floor** (exactly the placement section 4.3 requires); `backroom_cam1.png` is a sharp
+lab scene where furniture, cabinets and cardboard boxes are all recognizable. **The pipeline itself works.**
 
-## 修改上游程式碼的紀錄
+## Log of upstream code changes
 
-### nerfstudio 的 torch.load（三處）
+### nerfstudio's torch.load (three places)
 
-**症狀**：`_pickle.UnpicklingError: Weights only load failed ...
+**Symptom**: `_pickle.UnpicklingError: Weights only load failed ...
 Unsupported global: GLOBAL numpy.core.multiarray.scalar`
 
-**原因**：PyTorch **2.6 起 `torch.load` 的 `weights_only` 預設由 False 改為 True**。
-nerfstudio 1.1.5 寫於 2024 年，呼叫時沒帶這個參數，而 checkpoint 內含 numpy scalar。
-本專案為了 Blackwell(sm_120) 必須用 torch>=2.7，兩者必然衝突。
+**Cause**: **Since PyTorch 2.6, the default of `weights_only` in `torch.load` changed from False to True**.
+nerfstudio 1.1.5 was written in 2024 and does not pass this argument, while the checkpoint contains numpy scalars.
+This project must use torch>=2.7 for Blackwell(sm_120), so the two inevitably conflict.
 
-**改了哪裡**（都加上 `weights_only=False` 與說明註解）：
+**What was changed** (each got `weights_only=False` plus an explanatory comment):
 
-| 檔案 | 行 | 影響的功能 |
+| File | Line | Affected functionality |
 |---|---|---|
-| `nerfstudio/utils/eval_utils.py` | 62 | `eval_setup` → 渲染、`ns-export`（第 8 章）、`ns-viewer` |
-| `nerfstudio/engine/trainer.py` | 432 | 從 `load_dir` 續訓 |
-| `nerfstudio/engine/trainer.py` | 443 | 從指定 checkpoint 載入 |
+| `nerfstudio/utils/eval_utils.py` | 62 | `eval_setup` -> rendering, `ns-export` (chapter 8), `ns-viewer` |
+| `nerfstudio/engine/trainer.py` | 432 | resume training from `load_dir` |
+| `nerfstudio/engine/trainer.py` | 443 | load from a specified checkpoint |
 
-（`scripts/downloads/download_data.py:517` 也有一處，用不到，未改。）
+(`scripts/downloads/download_data.py:517` has one more, which is not used and was not changed.)
 
-⚠️ **這是改在 site-packages 裡，重裝 nerfstudio 會被覆蓋。**
-若日後 `pip install --force-reinstall nerfstudio`，要重做這三處。
+⚠️ **This change is inside site-packages; reinstalling nerfstudio overwrites it.**
+If you ever run `pip install --force-reinstall nerfstudio`, redo these three places.
 
-⚠️ `weights_only=False` 會執行 checkpoint 內的 pickle，
-只對自己產生或信任來源（此處為論文作者的官方資料）的檔案使用。
+⚠️ `weights_only=False` executes the pickle inside the checkpoint;
+use it only on files you produced yourself or from a trusted source (here, the paper authors' official data).
 
-## 磁碟
+## Disk
 
-`repos/SousVide/gsplats.zip` 4.4 GB，已解壓成 `gsplats/` 5.0 GB。
-zip 可刪（尚未刪，留給你決定）。
+`repos/SousVide/gsplats.zip` is 4.4 GB, extracted into `gsplats/` at 5.0 GB.
+The zip can be deleted (not deleted yet; left for you to decide).

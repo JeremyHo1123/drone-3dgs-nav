@@ -5,6 +5,13 @@
 #   ./tools/run_pipeline.sh --scene scene05 --config iphone12_600
 #   ./tools/run_pipeline.sh --scene scene05 --config iphone12_600 --stages scale,train
 #   ./tools/run_pipeline.sh --scene scene05 --config iphone12_600 --stages export,verify
+#   ./tools/run_pipeline.sh --scene scene05 --config iphone12_600 --stages scale --tag-rule present
+#     (--tag-rule present: use every image containing the marker id, ignoring
+#      spurious detections of other ids on grass; see build_gsplat.py)
+#     (--level-ground 12: after scaling, rotate so the ground within 12 m is
+#      horizontal; fixes a tag that was not lying flat)
+#     (--min-tag-px 0: use every tag observation for the scale solve, as upstream
+#      does; the default 100 keeps only close-range ones. scene04 was built with 0)
 #
 # Stages, in order:
 #   frames  extract frames from the video by farthest point sampling
@@ -15,13 +22,15 @@
 #   export  back-project a dense point cloud from the trained model
 #   verify  automatic scale checks (ground plane, detected planes)
 #
-# The video must sit in repos/SousVide/gsplats/capture/ with the scene name in
-# its filename, matching exactly one file.
+# The video must sit in repos/SousVide/gsplats/capture/ named <scene>.MOV or
+# <scene>_<anything>.MOV, matching exactly one file.
 
 set -o pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CONDA_BASE=${CONDA_BASE:-/home/jeremy/anaconda3}
+# conda install directory: $CONDA_BASE if set, else derived from $CONDA_EXE (exported by
+# `conda init`), else ~/anaconda3. Set CONDA_BASE yourself if conda lives elsewhere.
+CONDA_BASE=${CONDA_BASE:-$(dirname "$(dirname "${CONDA_EXE:-$HOME/anaconda3/bin/conda}")")}
 
 # PATH must satisfy two things at once. Getting this wrong is the single most
 # common way to break a run, because the failures look unrelated:
@@ -41,7 +50,7 @@ export PYTHONUNBUFFERED=1
 
 PY="$CONDA_BASE/envs/droneenv/bin/python -u"
 W="$ROOT/repos/SousVide/gsplats/workspace"
-SCENE=""; CFG=""; SELECT="uniform"
+SCENE=""; CFG=""; SELECT="uniform"; TAGRULE="exact"; LEVEL=0; MINPX=""
 STAGES="frames,sfm,check,scale,train,export,verify"
 
 while [ $# -gt 0 ]; do
@@ -49,8 +58,11 @@ while [ $# -gt 0 ]; do
     --scene)  SCENE="$2";  shift 2 ;;
     --config) CFG="$2";    shift 2 ;;
     --select) SELECT="$2"; shift 2 ;;
+    --tag-rule) TAGRULE="$2"; shift 2 ;;
+    --level-ground) LEVEL="$2"; shift 2 ;;
+    --min-tag-px) MINPX="$2"; shift 2 ;;
     --stages) STAGES="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1"; exit 2 ;;
   esac
 done
@@ -65,7 +77,7 @@ log () { echo ""; echo "══════════════════�
 run_build_stage () {
   log "stage: $1"
   cd "$ROOT"
-  $PY tools/build_gsplat.py --scene "$SCENE" --config "$CFG" --select "$SELECT" --stage "$1" \
+  $PY tools/build_gsplat.py --scene "$SCENE" --config "$CFG" --select "$SELECT" --tag-rule "$TAGRULE" --level-ground "$LEVEL" ${MINPX:+--min-tag-px "$MINPX"} --stage "$1" \
     || { echo "[$(date '+%F %T')] FAILED: $1"; exit 1; }
   echo "[$(date '+%F %T')] done: $1"
 }

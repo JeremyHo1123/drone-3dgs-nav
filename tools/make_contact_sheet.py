@@ -1,9 +1,9 @@
 """
-把訓練用的影像做成可快速掃視的接觸表，並標出每張的銳利度。
+Turn the training images into contact sheets that can be scanned quickly, with each image's sharpness labeled.
 
-用途：肉眼檢查訓練資料品質——哪些幀糊、哪些區域重複、覆蓋是否均勻。
-銳利度用 Laplacian 變異數，數值越大越銳利（此指標同時受畫面內容影響，
-同一場景內比較才有意義）。
+Purpose: visually check training data quality - which frames are blurry, which areas are repeated, whether coverage is even.
+Sharpness is the Laplacian variance; larger means sharper (this metric is also affected by image content,
+so comparisons are only meaningful within the same scene).
 """
 import argparse, glob
 from pathlib import Path
@@ -18,9 +18,9 @@ ap.add_argument("--thumb-w", type=int, default=170)
 a = ap.parse_args()
 
 fs = sorted(glob.glob(f"{a.dir}/*.png"))
-out = Path("/home/jeremy/drone/review") / f"sheets_{a.tag}"
+out = Path(__file__).resolve().parent.parent / "review" / f"sheets_{a.tag}"
 out.mkdir(parents=True, exist_ok=True)
-print(f"  {a.tag}: {len(fs)} 張")
+print(f"  {a.tag}: {len(fs)} images")
 
 sharp = []
 thumbs = []
@@ -54,9 +54,9 @@ for s in range(n_sheet):
         sheet[r*(th+4):r*(th+4)+th, c*(a.thumb_w+4):c*(a.thumb_w+4)+a.thumb_w] = t
     p = out / f"sheet_{s+1:02d}.jpg"
     cv2.imwrite(str(p), sheet, [cv2.IMWRITE_JPEG_QUALITY, 88])
-    print(f"    {p.name}  ({min(per,len(fs)-s*per)} 張)")
+    print(f"    {p.name}  ({min(per,len(fs)-s*per)} images)")
 
-# 最銳利 / 最模糊各 10 張
+# 10 sharpest / 10 blurriest
 for name, idx in [("sharpest", np.argsort(-sharp)[:10]), ("blurriest", np.argsort(sharp)[:10])]:
     W = 300
     tw = [cv2.resize(cv2.imread(fs[i]), (W, int(W*cv2.imread(fs[i]).shape[0]/cv2.imread(fs[i]).shape[1]))) for i in idx]
@@ -70,6 +70,6 @@ for name, idx in [("sharpest", np.argsort(-sharp)[:10]), ("blurriest", np.argsor
     cv2.imwrite(str(p), grid, [cv2.IMWRITE_JPEG_QUALITY, 92])
     print(f"    {p.name}")
 
-print(f"  銳利度: 中位數 {np.median(sharp):.0f}, "
-      f"5/95 百分位 {np.percentile(sharp,5):.0f}/{np.percentile(sharp,95):.0f}, "
-      f"<60 的有 {(sharp<60).sum()} 張")
+print(f"  sharpness: median {np.median(sharp):.0f}, "
+      f"5/95 percentile {np.percentile(sharp,5):.0f}/{np.percentile(sharp,95):.0f}, "
+      f"{(sharp<60).sum()} images below 60")

@@ -1,7 +1,7 @@
 """
-把點雲畫成帶公尺格線的俯視圖與側視圖，方便對照實際場地量測。
+Plot the point cloud as top and side views with a meter grid, for easy comparison with measurements of the real site.
 
-座標系：原點在 ArUco tag，z 軸向上（重力反方向）。
+Coordinate frame: origin at the ArUco tag, z axis up (opposite to gravity).
 """
 import argparse
 from pathlib import Path
@@ -21,23 +21,23 @@ def main():
     ap.add_argument("--scene", required=True)
     ap.add_argument("--pcd", default=None)
     ap.add_argument("--clip", type=float, default=99.0,
-                    help="裁掉離群點的百分位（預設 99）")
+                    help="percentile for clipping outliers (default 99)")
     args = ap.parse_args()
 
     p = Path(args.pcd) if args.pcd else WS / args.scene / "sparse_pc.ply"
     pcd = o3d.io.read_point_cloud(str(p))
     P = np.asarray(pcd.points)
     C = np.asarray(pcd.colors) if pcd.has_colors() else None
-    print(f"  載入 {len(P):,} 點")
+    print(f"  loaded {len(P):,} points")
 
-    # 去離群：統計濾波 + 百分位裁切
+    # outlier removal: statistical filter + percentile clipping
     pcd2, keep = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     P, C = P[keep], (C[keep] if C is not None else None)
     lo, hi = np.percentile(P, 100 - args.clip, axis=0), np.percentile(P, args.clip, axis=0)
     m = np.all((P >= lo) & (P <= hi), axis=1)
     P, C = P[m], (C[m] if C is not None else None)
-    print(f"  去離群後 {len(P):,} 點")
-    print(f"  範圍 x [{P[:,0].min():.2f}, {P[:,0].max():.2f}]  "
+    print(f"  {len(P):,} points after outlier removal")
+    print(f"  range x [{P[:,0].min():.2f}, {P[:,0].max():.2f}]  "
           f"y [{P[:,1].min():.2f}, {P[:,1].max():.2f}]  "
           f"z [{P[:,2].min():.2f}, {P[:,2].max():.2f}]")
 
@@ -61,7 +61,7 @@ def main():
         ax.yaxis.set_major_locator(plt.MultipleLocator(1.0))
         ax.xaxis.set_minor_locator(plt.MultipleLocator(0.5))
         ax.yaxis.set_minor_locator(plt.MultipleLocator(0.5))
-        # 標出 ArUco 原點
+        # mark the ArUco origin
         ax.plot(0, 0, "r+", ms=16, mew=2.5)
         ax.annotate("ArUco (0,0)", (0, 0), xytext=(6, 6),
                     textcoords="offset points", color="red", fontsize=9)
@@ -70,7 +70,7 @@ def main():
                  fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=110)
-    print(f"  已存 {out}")
+    print(f"  saved {out}")
 
 
 if __name__ == "__main__":
