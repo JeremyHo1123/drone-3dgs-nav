@@ -167,6 +167,9 @@ def run_episode(task, start_deg, idx):
     env.prev_lin_vel[:] = 0
     env.calculateObservations()                  # render the start pose
     pol.instruction = task
+    if pol.start_mode == "upstream":
+        # v1/v2 training started each episode from this drone's own hover command (it differs from nominal with --dr)
+        pol.start_action = env.actions[0].clone()
     pol.reset(scene_state(env.state_joint_q[0], env.state_joint_qd[0]), stash["img"])
 
     traj = [np.r_[env.state_joint_q[0].cpu().numpy(), env.state_joint_qd[0].cpu().numpy()]]

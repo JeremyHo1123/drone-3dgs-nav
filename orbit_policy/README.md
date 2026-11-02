@@ -1,4 +1,4 @@
-# Orbit-the-box policy (v4)
+# Orbit-the-box policy
 
 A trained GRaD-Nav++ vision-language policy that circles a stack of boxes in the [`sunny_baseball_field`](../scenes/sunny_baseball_field/README.md) scene: radius 2.5 m, flight-controller height 1.0 m, 0.5 m/s, nose (camera) always on the box. The language instruction picks the direction — task 0 clockwise, task 1 counter-clockwise, seen from above. Every 0.05 s (20 Hz) it reads one RGB camera image plus height, attitude and velocity, and outputs body rates and thrust.
 
@@ -7,6 +7,16 @@ This folder has the weights' loader and inference code — the same code that ru
 <img src="figures/sim_top_view.png" width="49%"> <img src="figures/sim_onboard_camera.png" width="49%">
 
 *Left: two episodes in the simulator, top view (`run_in_sim.py --out-dir`). Right: what the policy sees, 256×144, 12 s into the clockwise episode.*
+
+Two versions are published. Both complete a full lap in every simulator episode below; they differ in the simulator they were trained in:
+
+| | v4 (default) | v2 |
+|---|---|---|
+| Weights | [`orbit-policy-v4`](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v4) → `orbit_policy/bundle_v4/` | [`orbit-policy-v2`](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v2) → `orbit_policy/bundle_v2/` |
+| Trained | 2026-10-29, with the real drone's command latency and motor response, plus a height integrator | 2026-09-27, in the ideal simulator (a command acts in the same step) |
+| Real drone | Deployed, not flown yet | Oscillated up and down within 1–2 s on its first real flight (2026-10-19), see [v2](#the-v2-policy) |
+
+Everything below is about v4 unless it says v2; [The v2 policy](#the-v2-policy) has v2's numbers and commands.
 
 ## Results in the simulator
 
@@ -126,20 +136,60 @@ python orbit_policy/run_in_sim.py --start-deg 0 90 180 270 --dr --out-dir runs/o
 
 | Option | Default | Meaning |
 |---|---|---|
+| `--bundle` | `orbit_policy/bundle_v4` | Folder with `weights.pt`; `orbit_policy/bundle_v2` for v2 |
 | `--tasks 0 1` | both | 0 = clockwise, 1 = counter-clockwise |
 | `--start-deg ...` | `270` | Start bearings on the circle, degrees from the box centre (0 = +x of the scene, counter-clockwise positive). One episode per bearing and task. The policy was trained from all bearings |
 | `--steps` | `700` | Steps per episode (0.05 s each; 700 = 35 s, about 1.1 laps). The policy only knows how to keep orbiting: stopping after a lap, take-off and landing are done by the onboard program on the drone |
-| `--latency cfg\|off` | `cfg` | `cfg`: the command-latency and motor-response model from training (delay, jitter, motor time constants and thrust curve drawn at random per episode). `off`: commands act immediately |
+| `--latency cfg\|off` | `cfg` | `cfg`: the command-latency and motor-response model from training (delay, jitter, motor time constants and thrust curve drawn at random per episode; v2 was trained without one, so for v2 `cfg` means none). `off`: commands act immediately |
 | `--dr` | off | Randomise mass and maximum thrust per episode, as in training |
 | `--seed` | `0` | Same seed, same machine → identical episodes |
 | `--out-dir`, `--video` | — | Write `metrics.json` (per-episode numbers and trajectories), `top_view.png`, and with `--video` the onboard camera as MP4 |
+
+## The v2 policy
+
+v2 is the first version that completes a full lap (v1, not published, never did: it flew 15 cm low at under half the target speed and got stuck east of the box). It was trained in the simulator with the same scene, task and reward as v4, but **without** the command-latency model, the height integrator and the deployment-style episode start, which all came later.
+
+| File (release [`orbit-policy-v2`](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v2)) | Size | sha256 |
+|---|---|---|
+| `weights.pt` | 15 MB | `f5c13ad40b884704e572d7c4047c9faa7ba8bd6128f0b08d4deda66bc75225fd` |
+| `reference.pt` | 38 MB | `4d227569c2c36c10cc5ea3808c066fd219e8e077676b64ea63fbdc66052b53b3` |
+
+It uses the same code and the same simulator patch; only the folder changes:
+
+```bash
+gh release download orbit-policy-v2 -R JeremyHo1123/drone-3dgs-nav --dir orbit_policy/bundle_v2
+(cd orbit_policy && python parity_check.py --bundle bundle_v2)      # PASS; largest command difference 2.8e-6 here
+python orbit_policy/run_in_sim.py --bundle orbit_policy/bundle_v2
+```
+
+Expected output of the last command:
+
+```
+task 0 (clockwise), start 270 deg: flew 35.0 s, one lap in 28.1 s; radius err 41.3 cm rms, height err 4.5 cm rms, nose off box 4.4 deg, speed 0.49 m/s, |vz| max 0.21 m/s; cmd diff 0.0e+00; 10 s wall
+task 1 (counter-clockwise), start 270 deg: flew 35.0 s, one lap in 29.6 s; radius err 30.7 cm rms, height err 3.6 cm rms, nose off box 3.6 deg, speed 0.49 m/s, |vz| max 0.20 m/s; cmd diff 0.0e+00; 10 s wall
+largest command difference between deployment code and simulator: 0.0e+00  (OK)
+```
+
+Side by side, each in the simulator it was trained in, 8 episodes each (`--start-deg 0 90 180 270 --dr`: four start points, both directions, randomised mass and thrust):
+
+| | v2 (no latency) | v4 (with its latency model) |
+|---|---|---|
+| Full lap | 8 / 8, in 27.8–29.8 s | 8 / 8, in 24.6–31.8 s |
+| Height error, RMS | 2.5–6.6 cm | 1.6–6.4 cm |
+| Radius error, RMS | 31–45 cm | 21–42 cm |
+| Nose off the box, mean | 3.1–7.0° | 2.0–7.6° |
+| Largest \|vertical speed\| after 2 s | 0.16–0.22 m/s | 0.10–0.26 m/s |
+
+**Do not expect v2 to fly like this on a real drone.** On its first real flight it oscillated up and down with a period of about 0.9 s, growing each cycle, until the onboard safety check stopped it after 1.3 s and 0.85 s. The cause is the delay its training simulator did not have: about 55 ms from measuring the state to PX4 receiving the command, plus the motors' own response time (20–40 ms speeding up, 60–150 ms slowing down): v2 learned very strong height corrections that are only stable without delay. With the delays measured on that flight added to the simulator, all 16 of 16 simulated drones oscillated the same way. That is why v4 was trained with `LATENCY_MODEL`. To see v2 fail, it would have to run with v4's latency settings; `run_in_sim.py` does not do that (it always uses the settings the bundle was trained with).
+
+For use outside the simulator, v2 takes `OrbitPolicy("bundle_v2")` with the default `T_hover=0.65, thrust_exponent=1.67` (its bundle does not record them).
 
 ## Using the policy outside this simulator
 
 ```python
 from orbit_runtime import OrbitPolicy, SceneState
 
-pol = OrbitPolicy("bundle_v4", instruction=0, T_hover=0.65, thrust_exponent=1.3)   # v4 requires these two values
+pol = OrbitPolicy("bundle_v4", instruction=0, T_hover=0.65, thrust_exponent=1.3)   # v4 requires these two values; v2: OrbitPolicy("bundle_v2")
 pol.reset(state, image)          # at hand-over
 while flying:
     cmd = pol.act()              # cmd.body_rate_flu (rad/s), cmd.sim_thrust_frac, cmd.px4_thrust

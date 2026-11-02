@@ -52,10 +52,11 @@ A GRaD-Nav++ policy trained in `sunny_baseball_field` that circles the box stack
 
 | | |
 |---|---|
-| Weights | [`orbit-policy-v4` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v4), 15 MB (+ 38 MB check file) |
+| Weights, v4 | [`orbit-policy-v4` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v4), 15 MB (+ 38 MB check file). Trained with the real drone's command latency |
+| Weights, v2 | [`orbit-policy-v2` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v2), same sizes. Trained without latency: orbits fine in the simulator, oscillated on the real drone |
 | Inference code and how to run it | [`orbit_policy/`](orbit_policy/README.md) — the same code that runs on the drone's Jetson |
 | Simulator | [`configs/grad_nav/`](configs/grad_nav/README.md) — a patch for grad_nav: this drone, camera and scene, the task, command latency |
-| In the simulator | One lap in 25–32 s, height error 2–3 cm RMS, radius error 24–38 cm RMS (flies on the inside) |
+| In the simulator | Both complete a full lap every time: one lap in 25–32 s, height error 2–7 cm RMS, radius error 21–45 cm RMS (both fly on the inside) |
 
 The training code itself is not published.
 
@@ -633,4 +634,4 @@ The notes and some tool messages refer to "chapter N" of the original plan (`imp
 
 The tools and notes in this repository are the author's own work. The upstream projects carry their own licenses — see [SousVide](https://github.com/StanfordMSL/SousVide) and [grad_nav](https://github.com/Qianzhong-Chen/grad_nav).
 
-The parts derived from grad_nav — `orbit_policy/gradnav_models/`, the simulator patch in `configs/grad_nav/`, and the policy weights in the `orbit-policy-v4` release — are under grad_nav's **NVIDIA Source Code License**: non-commercial use only (research or evaluation). Full text: [`orbit_policy/LICENSE-grad_nav.md`](orbit_policy/LICENSE-grad_nav.md).
+The parts derived from grad_nav — `orbit_policy/gradnav_models/`, the simulator patch in `configs/grad_nav/`, and the policy weights in the `orbit-policy-v4` and `orbit-policy-v2` releases — are under grad_nav's **NVIDIA Source Code License**: non-commercial use only (research or evaluation). Full text: [`orbit_policy/LICENSE-grad_nav.md`](orbit_policy/LICENSE-grad_nav.md).
