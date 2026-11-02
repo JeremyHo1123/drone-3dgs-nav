@@ -44,17 +44,35 @@ The trained checkpoints are too large for a git repo, so each one is attached to
 
 ---
 
+## Trained policy: orbit the box
+
+A GRaD-Nav++ policy trained in `sunny_baseball_field` that circles the box stack at 2.5 m, 1.0 m high, nose on the box, clockwise or counter-clockwise on a language instruction. Weights, inference code and the simulator patch are published, so you can fly it in the same 3DGS simulator it was trained in:
+
+<img src="orbit_policy/figures/sim_top_view.png" width="49%"> <img src="orbit_policy/figures/sim_onboard_camera.png" width="49%">
+
+| | |
+|---|---|
+| Weights | [`orbit-policy-v4` release](https://github.com/JeremyHo1123/drone-3dgs-nav/releases/tag/orbit-policy-v4), 15 MB (+ 38 MB check file) |
+| Inference code and how to run it | [`orbit_policy/`](orbit_policy/README.md) — the same code that runs on the drone's Jetson |
+| Simulator | [`configs/grad_nav/`](configs/grad_nav/README.md) — a patch for grad_nav: this drone, camera and scene, the task, command latency |
+| In the simulator | One lap in 25–32 s, height error 2–3 cm RMS, radius error 24–38 cm RMS (flies on the inside) |
+
+The training code itself is not published.
+
+---
+
 ## What is in this repo
 
 | | |
 |---|---|
 | [`tools/`](tools/) | 18 scripts — camera calibration, ArUco, capture pre-check, frame extraction and mapping, intrinsics hand-over, scale verification, export, evaluation, dynamics checks |
 | [`notes/`](notes/) | Chapter-by-chapter implementation records, including every deviation from upstream and why |
-| [`configs/`](configs/) | Camera intrinsics and capture configs |
+| [`configs/`](configs/) | Camera intrinsics and capture configs; [`configs/grad_nav/`](configs/grad_nav/README.md): the simulator patch for grad_nav |
 | [`scenes/`](scenes/) | Two complete, scale-verified example scenes |
+| [`orbit_policy/`](orbit_policy/README.md) | Inference code for the trained orbit policy, a parity check, and a script that flies it in the simulator |
 | [`CLAUDE.md`](CLAUDE.md) | Project goals, constraints, expectation management |
 
-**Not in this repo:** the upstream repos, capture videos, extracted images, SfM intermediates, and training checkpoints — about 49 GB in total. All of it is either downloadable or reproducible. Each section below says how.
+**Not in this repo:** the upstream repos, capture videos, extracted images, SfM intermediates, and training checkpoints — about 49 GB in total. All of it is either downloadable or reproducible. Each section below says how. The policy training code is not published.
 
 ---
 
@@ -566,12 +584,14 @@ grad_nav has several values baked in for the authors' own drone (`carl`). **Thes
 | File | Hardcoded | Change to |
 |---|---|---|
 | `utils/gs_local.py` | `fx=462.956, fy=463.002, cx=323.076, cy=181.184` at 640×360 | These are RealSense D435 values — use your own onboard camera's |
-| `utils/gs_local.py` | three constant matrices in `pose2nerf_transform()` | `T_r2d` is the camera's **mounting extrinsics** (theirs: 15.2 cm forward, 8° down) |
+| `utils/gs_local.py` | three constant matrices in `pose2nerf_transform()` | `T_r2d` is the camera's **mounting extrinsics**, in body FRD (x forward, y right, z down). Theirs: 15.2 cm forward, 3.1 cm left, 1.2 cm up, pitched 8° **up** — the upstream comment gets the directions backwards |
 | `utils/gs_local.py` **and** `envs/*.py` | a `maps` dict in each | **Add your scene to both** |
 | `envs/drone_long_traj.py` | `gs_origin_offset = [-6.0, 0, 0]` | Match your scene's origin |
 | `envs/drone_vla_*.py` | `task_table` | Instruction strings and their waypoints |
+| `envs/*.py` rendering | position y, z negated before the renderer, quaternion not | The camera looks in the mirror image of the body yaw. Harmless while yaw stays near 0; any task that turns needs the quaternion converted too |
+| `envs/*.py` `calculateReward` | thrust penalty around `0.42` | That is carl's hover command; use your own airframe's |
 
-Record what you change and why.
+Record what you change and why. [`configs/grad_nav/grad_nav_simulator_v4.patch`](configs/grad_nav/README.md) makes all of these changes for this project's drone and scenes.
 
 ### 6.4 Inherent limits of this approach
 
@@ -612,3 +632,5 @@ The notes and some tool messages refer to "chapter N" of the original plan (`imp
 ## License
 
 The tools and notes in this repository are the author's own work. The upstream projects carry their own licenses — see [SousVide](https://github.com/StanfordMSL/SousVide) and [grad_nav](https://github.com/Qianzhong-Chen/grad_nav).
+
+The parts derived from grad_nav — `orbit_policy/gradnav_models/`, the simulator patch in `configs/grad_nav/`, and the policy weights in the `orbit-policy-v4` release — are under grad_nav's **NVIDIA Source Code License**: non-commercial use only (research or evaluation). Full text: [`orbit_policy/LICENSE-grad_nav.md`](orbit_policy/LICENSE-grad_nav.md).

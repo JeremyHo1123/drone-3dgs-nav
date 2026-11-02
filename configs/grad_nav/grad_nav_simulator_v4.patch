@@ -1,0 +1,2332 @@
+diff --git a/envs/__init__.py b/envs/__init__.py
+old mode 100755
+new mode 100644
+index 16f734e..c7b9d63
+--- a/envs/__init__.py
++++ b/envs/__init__.py
+@@ -11,6 +11,7 @@ from envs.drone_ppo import DronePPOEnv
+ from envs.drone_multi_gate import DroneMultiGateEnv
+ from envs.drone_vla_long_task import DroneVLALongTaskEnv
+ from envs.drone_vla_multi_map import DroneVLAMultiMapEnv
++from envs.drone_vla_orbit import DroneVLAOrbitEnv  # added in this project: orbit-the-box inspection, sunny_baseball_field
+ 
+ 
+ 
+diff --git a/envs/assets/command_latency.py b/envs/assets/command_latency.py
+new file mode 100644
+index 0000000..03615d7
+--- /dev/null
++++ b/envs/assets/command_latency.py
+@@ -0,0 +1,276 @@
++"""
++Added in this project (2026-10-19): the real drone's command latency and the motor response of the thrust, in the
++simulator used to train the orbit-the-box policy.
++
++Background: on 2026-10-19 the v2 policy flew on the real drone for the first time and both times oscillated up and
++down within 1-2 s (period about 0.9 s, growing) until the |vz| > 0.8 m/s safety check stopped it. In the original
++simulator a command takes effect in the same step and the thrust equals the command; the real drone adds about 55 ms
++of pipeline delay (pose to the Jetson, policy, command to PX4), the thrust goes through the motor response (20-40 ms
++when increasing, 60-150 ms when decreasing), and thrust scales with throttle to the power of about 1.3 (the onboard
++program assumed 1.67).
++
++Settings: LATENCY_MODEL (dict) in env_hyper. Without the key, or if enabled is not True, this class is not created and
++the environment runs the original code (step() in envs/drone_vla_long_task.py calls the original
++QuadrotorSimulator.run_simulation, unchanged).
++
++  LATENCY_MODEL:
++    enabled: True
++    delay: True              # command delay (body rates and thrust delayed together)
++    delay_ms: [30, 100]      # base delay d, drawn per drone and episode ("state measured" to "PX4 receives the command"); a single number = fixed, e.g. 55
++    jitter_ms: [0, 30]       # extra delay drawn for every command (every step); 0 = no jitter
++    motor: True              # motor response of the thrust + thrust-vs-throttle exponent
++    tau_up_ms: [15, 50]      # first-order time constant when the thrust increases (applied to the throttle)
++    tau_dn_ms: [50, 180]     # first-order time constant when the thrust decreases
++    p_real: [1.1, 1.6]       # real thrust ~ throttle^p_real
++    u_hover: [0.62, 0.69]    # real hover throttle (changes with battery voltage)
++    p_prog: 1.3              # exponent the onboard program uses to turn the sim thrust fraction into throttle (thrust_exponent in orbit_runtime.py)
++    t_hover_prog: 0.65       # hover throttle assumed by the onboard program (T_hover in orbit_runtime.py)
++    f_hover_prog: 0.2438     # hover thrust fraction of the onboard program (bundle meta hover_thrust_frac = 3.15 kg x g / 126.75)
++    thrust_ref: weight       # thrust formula (added 2026-10-20, see below): weight = m*g*(y/u_hover)^p_real (default);
++                             #   max_thrust = max_thrust*f_hover_prog*(y/u_hover)^p_real (mass and max_thrust randomisation still apply)
++    hist_len: 6              # number of past commands kept; must cover the maximum delay (6 steps = 250 ms)
++    hold_start_s: 0.0        # for this long after the episode start commands have no effect (zero rates, hover thrust): PX4 not yet in rate control
++
++Command delay: keep the last hist_len "mixed commands" (the omega and thrust fraction f sent to PX4; entry 0 is the one
++  just computed), each with its own delay (d + the jitter drawn for that step). Entry j was sent j*dt before this step
++  started and takes effect at -j*dt + delay. Each physics substep (time t_in within this step) uses the newest entry
++  already in effect. Without jitter this is
++      j = clamp(ceil((d - t_in) / dt), 0, hist_len - 1)
++  Example: d = 55 ms -> at t_in = 0 the command from two steps ago, from t_in >= 5 ms the previous step's; this step's
++  command takes effect 5 ms into the next step.
++  Jitter uses "each command its own delay, the newest arrived one wins" rather than one d per step: with a shared d, a
++  30 ms jump in d would replace a command already in effect by an older one, which the real drone never does (commands
++  are sent and arrive in order). Without jitter both give the same result.
++  Values are picked by index (gather), so gradients flow back to the step that produced the command.
++
++Motor response of the thrust (one throttle state y per drone; at episode start y = this drone's hover throttle y_hover, see below):
++      u_cmd = t_hover_prog * (f / f_hover_prog)^(1 / p_prog), clipped to 0-1     (the onboard program's conversion)
++      tau = tau_up if u_cmd > y else tau_dn
++      y <- y + (1 - exp(-h / tau)) * (u_cmd - y)                                 (h = physics substep, 200 Hz = 5 ms)
++      thrust = S * (y / u_hover)^p_real + the original thrust noise (N(0, 0.01) x max_thrust), along body z as before
++  S depends on thrust_ref (added 2026-10-20; the v3 training uses max_thrust, option (b)):
++    weight (default, formula (a)): S = m*g, y_hover = u_hover.
++      The thrust depends only on m*g, u_hover and p_real; the original max_thrust randomisation no longer affects the
++      thrust (max_thrust only sets the noise level), and the mass cancels in the acceleration except for air drag. The
++      hover thrust fraction varies only about +-7% (from u_hover alone), against about +-18% originally.
++      With p_prog = p_real and u_hover = t_hover_prog the steady thrust is m*g*f / f_hover_prog, which equals the
++      original "thrust = f x max_thrust" only for the nominal airframe (3.15 kg, 126.75).
++    max_thrust (b): S = max_thrust * f_hover_prog. On the nominal airframe S = m*g, identical to weight.
++      The original independent randomisation of mass and max_thrust still applies: u_hover becomes "the hover throttle
++      of the nominal airframe", and this drone's hover throttle is y_hover = u_hover * (m*g / S)^(1/p_real), clipped to
++      0-1 (about 0.53-0.82 over the training range).
++      With p_prog = p_real and u_hover = t_hover_prog the steady thrust is f x max_thrust for any mass and max_thrust,
++      exactly the original simulator (this model generalises it). Hover thrust fraction: 98% of the airframes within
++      -16% to +23% of nominal (originally -15% to +18%).
++  At episode start and during hold_start_s the throttle is y_hover (thrust = m*g: PX4 hovers by itself before hand-over).
++
++Body rates: delay only (the simulator already has a body-rate PD controller and inertia).
++Observation unchanged: "this step's and the previous step's command" seen by the policy are still the mixed commands
++before the delay (the onboard program puts the same into the observation).
++
++Gradients: all torch ops; the command history and the throttle state are new tensors every step (no in-place writes)
++and are cloned before being changed at an episode reset; the per-episode parameters (d, tau, p_real, u_hover) are also
++cloned before being changed (they are already in the graph, and in-place writes would break backprop).
++At the start of each BPTT segment (32 steps) detach_state() cuts the link to the previous segment (called from
++DroneVLAOrbitEnv.clear_grad).
++"""
++import math
++
++import torch
++
++DEFAULTS = dict(
++    enabled=False,
++    delay=True, delay_ms=[30.0, 100.0], jitter_ms=[0.0, 30.0],
++    motor=True, tau_up_ms=[15.0, 50.0], tau_dn_ms=[50.0, 180.0], p_real=[1.1, 1.6], u_hover=[0.62, 0.69],
++    p_prog=1.3, t_hover_prog=0.65, f_hover_prog=0.2438, thrust_ref="weight",
++    hist_len=6, hold_start_s=0.0,
++)
++THRUST_REFS = ("weight", "max_thrust")
++G = 9.81
++
++
++def _range(v):
++    """A setting is either a number (fixed) or [low, high] (uniform random)."""
++    if isinstance(v, (list, tuple)):
++        if len(v) != 2 or float(v[0]) > float(v[1]):
++            raise ValueError(f"LATENCY_MODEL ranges must be [low, high], got {v}")
++        return float(v[0]), float(v[1])
++    return float(v), float(v)
++
++
++class CommandLatency:
++    def __init__(self, cfg, num_envs, device, dt, init_command, quad=None):
++        """quad: the environment's QuadrotorSimulator (per-drone m and max_thrust). Required when thrust_ref is max_thrust."""
++        unknown = set(cfg) - set(DEFAULTS)
++        if unknown:
++            raise ValueError(f"LATENCY_MODEL has unknown keys: {sorted(unknown)} (known: {sorted(DEFAULTS)})")
++        c = dict(DEFAULTS)
++        c.update(cfg)
++        self.cfg = c
++        self.n = num_envs
++        self.device = device
++        self.dt = float(dt)
++        self.delay = bool(c["delay"])
++        self.motor = bool(c["motor"])
++        self.delay_rng = tuple(x / 1000.0 for x in _range(c["delay_ms"]))
++        self.jitter_rng = tuple(x / 1000.0 for x in _range(c["jitter_ms"]))
++        self.tau_up_rng = tuple(x / 1000.0 for x in _range(c["tau_up_ms"]))
++        self.tau_dn_rng = tuple(x / 1000.0 for x in _range(c["tau_dn_ms"]))
++        self.p_real_rng = _range(c["p_real"])
++        self.u_hover_rng = _range(c["u_hover"])
++        self.p_prog = float(c["p_prog"])
++        self.t_hover_prog = float(c["t_hover_prog"])
++        self.f_hover_prog = float(c["f_hover_prog"])
++        self.thrust_ref = str(c["thrust_ref"])
++        if self.thrust_ref not in THRUST_REFS:
++            raise ValueError(f"LATENCY_MODEL thrust_ref must be one of {THRUST_REFS}, got {self.thrust_ref}")
++        self.hold_start_s = float(c["hold_start_s"])
++        self.H = int(c["hist_len"])
++        if self.tau_up_rng[0] <= 0 or self.tau_dn_rng[0] <= 0:
++            raise ValueError("LATENCY_MODEL tau_up_ms and tau_dn_ms must be > 0")
++        max_delay = (self.delay_rng[1] + self.jitter_rng[1]) if self.delay else 0.0
++        need = math.ceil(max_delay / self.dt - 1e-9)          # how many steps back to look at t_in = 0
++        if self.H < max(need + 1, 2):
++            raise ValueError(f"LATENCY_MODEL hist_len={self.H} is too short: a maximum delay of {max_delay * 1000:.0f} ms needs at least {need + 1} steps")
++
++        self.env_idx = torch.arange(num_envs, device=device)
++        self.j_idx = torch.arange(self.H, device=device).unsqueeze(0).expand(num_envs, self.H)
++        self.j_last = torch.full_like(self.j_idx, self.H - 1)
++        self.j_dt = (torch.arange(self.H, device=device, dtype=torch.float32) * self.dt).unsqueeze(0)
++
++        # Parameters of disabled parts stay fixed (no random draws): disabled parts must not consume random numbers, or the physics noise would change
++        full = lambda v: torch.full((num_envs,), float(v), device=device)  # noqa: E731
++        self.d_base, self.tau_up, self.tau_dn = full(0.0), full(self.tau_up_rng[0]), full(self.tau_dn_rng[0])
++        self.p_real, self.u_hover = full(self.p_prog), full(self.t_hover_prog)
++        all_ids = torch.arange(num_envs, device=device)
++        self._sample(all_ids)
++        cmd = torch.as_tensor(init_command, device=device, dtype=torch.float32).reshape(1, 1, 4)
++        self.cmd_hist = cmd.expand(num_envs, self.H, 4).clone()
++        self.cmd_delay = torch.zeros(num_envs, self.H, device=device)
++        self.y = self._hover_throttle(quad).clone()
++
++        self.record = False          # tools (reproduction, evaluation) set True: store diagnostics in self.last every step
++        self.last = {}
++
++    # ------------------------------------------------------------------ per-episode parameters
++    def _uniform(self, rng, n):
++        lo, hi = rng
++        if hi > lo:
++            return lo + (hi - lo) * torch.rand(n, device=self.device)
++        return torch.full((n,), lo, device=self.device)
++
++    def _sample(self, env_ids):
++        """Redraw the parameters of these drones. Only enabled parts are drawn (fixed values use no random numbers)."""
++        n = len(env_ids)
++        groups = []
++        if self.delay:
++            groups.append(("d_base", self.delay_rng))
++        if self.motor:
++            groups += [("tau_up", self.tau_up_rng), ("tau_dn", self.tau_dn_rng),
++                       ("p_real", self.p_real_rng), ("u_hover", self.u_hover_rng)]
++        for name, rng in groups:
++            v = getattr(self, name).clone()          # clone before writing: the old tensor may already be in the graph
++            v[env_ids] = self._uniform(rng, n)
++            setattr(self, name, v)
++
++    def _hover_throttle(self, quad):
++        """Hover throttle y_hover of each drone (thrust = m*g). weight: u_hover itself; max_thrust: u_hover*(m*g / S)^(1/p_real), clipped to 0-1.
++        Without the motor response the throttle state is unused; u_hover is returned as before."""
++        if self.thrust_ref == "weight" or not self.motor:
++            return self.u_hover
++        if quad is None:
++            raise ValueError("LATENCY_MODEL thrust_ref: max_thrust needs each drone's mass and max_thrust: pass quad to the constructor and reset()")
++        ratio = quad.m * G / (quad.max_thrust * self.f_hover_prog)
++        return (self.u_hover * ratio ** (1.0 / self.p_real)).clamp(0.0, 1.0)
++
++    def reset(self, env_ids, actions, prev_actions, quad=None):
++        """Episode reset: redraw parameters; set the command history to the reset command (entry 0 = actions, the rest = prev_actions, all already in effect);
++        set the throttle state to this drone's hover throttle. actions / prev_actions are the environment's self.actions, self.prev_actions after the reset;
++        quad is the QuadrotorSimulator after the reset (mass and max_thrust redrawn), required when thrust_ref is max_thrust."""
++        self._sample(env_ids)
++        hist = self.cmd_hist.clone()
++        hist[env_ids, 0] = actions[env_ids].detach()
++        hist[env_ids, 1:] = prev_actions[env_ids].detach().unsqueeze(1)
++        self.cmd_hist = hist
++        dl = self.cmd_delay.clone()
++        dl[env_ids] = 0.0
++        self.cmd_delay = dl
++        y = self.y.clone()
++        y[env_ids] = self._hover_throttle(quad)[env_ids]
++        self.y = y
++
++    def detach_state(self):
++        """Cut the graph to the previous segment at the start of each BPTT segment."""
++        self.cmd_hist = self.cmd_hist.detach().clone()
++        self.y = self.y.detach().clone()
++
++    # ------------------------------------------------------------------ per step
++    def _push(self, command):
++        if self.delay and self.jitter_rng[1] > 0.0:
++            d_new = self.d_base + self._uniform(self.jitter_rng, self.n)
++        else:
++            d_new = self.d_base
++        self.cmd_hist = torch.cat([command.unsqueeze(1), self.cmd_hist[:, :-1]], dim=1)
++        self.cmd_delay = torch.cat([d_new.unsqueeze(1), self.cmd_delay[:, :-1]], dim=1)
++
++    def _effective(self, t_in):
++        """The command in effect at time t_in within this step: the newest one that has arrived (delay - j*dt <= t_in); if none has, the oldest."""
++        arrived = (self.cmd_delay - self.j_dt) <= (t_in + 1e-6)          # 1 us tolerance: rounding must not turn "just arrived" into "not yet"
++        j = torch.where(arrived, self.j_idx, self.j_last).amin(dim=1)
++        return self.cmd_hist[self.env_idx, j], j
++
++    def simulate(self, quad, position, velocity, orientation, angular_velocity, command, step_count):
++        """Replaces QuadrotorSimulator.run_simulation (same return order). command = this step's mixed command (N, 4):
++        3 body rates (body FLU, rad/s) + thrust fraction f (0-0.5). step_count = steps since the episode start (progress_buf)."""
++        self._push(command)
++        n_sub, h = quad.n_steps, float(quad.dt)
++        motor_speeds = torch.zeros_like(command[:, 3])
++        hold = self.hold_start_s > 0.0
++        if hold:
++            t0 = step_count.to(torch.float32) * self.dt
++            zero_rates = torch.zeros_like(command[:, 0:3])
++        if self.motor:
++            scale = quad.m * G if self.thrust_ref == "weight" else quad.max_thrust * self.f_hover_prog   # S (see the header)
++            if hold:
++                y_hold = self._hover_throttle(quad)
++            a_up = 1.0 - torch.exp(-h / self.tau_up)
++            a_dn = 1.0 - torch.exp(-h / self.tau_dn)
++        elif hold:
++            f_hover_true = quad.m * G / quad.max_thrust
++        y = self.y
++        rec = self.record
++        if rec:
++            thr_sum = torch.zeros_like(motor_speeds)
++            f_sum = torch.zeros_like(motor_speeds)
++        j = torch.zeros(self.n, dtype=torch.long, device=self.device)
++        for i in range(n_sub):
++            t_in = i * h
++            if self.delay:
++                eff, j = self._effective(t_in)
++            else:
++                eff = command
++            rates, f = eff[:, 0:3], eff[:, 3]
++            if hold:
++                in_hold = (t0 + t_in) < self.hold_start_s
++                rates = torch.where(in_hold.unsqueeze(1), zero_rates, rates)
++            if self.motor:
++                u_cmd = torch.clamp(self.t_hover_prog * (f.clamp(min=1e-6) / self.f_hover_prog) ** (1.0 / self.p_prog), 0.0, 1.0)
++                if hold:
++                    u_cmd = torch.where(in_hold, y_hold, u_cmd)
++                y = y + torch.where(u_cmd > y, a_up, a_dn) * (u_cmd - y)
++                force = scale * (y / self.u_hover) ** self.p_real
++            else:
++                force = None
++                if hold:
++                    f = torch.where(in_hold, f_hover_true, f)
++            position, velocity, orientation, angular_velocity, lin_acc, ang_acc, motor_speeds = quad.update(
++                position, velocity, orientation, angular_velocity, rates, f, motor_speeds, thrust_force=force)
++            if rec:
++                with torch.no_grad():
++                    thr_sum += (force if force is not None else f * quad.max_thrust) / (quad.m * G)
++                    f_sum += f
++        self.y = y
++        if rec:
++            self.last = dict(thrust_over_weight=(thr_sum / n_sub).detach(), f_eff=(f_sum / n_sub).detach(),
++                             y=y.detach().clone(), j_last=j.detach().clone())
++        return position, velocity, angular_velocity, orientation, lin_acc, ang_acc
+diff --git a/envs/assets/height_integrator.py b/envs/assets/height_integrator.py
+new file mode 100644
+index 0000000..b7e3ae7
+--- /dev/null
++++ b/envs/assets/height_integrator.py
+@@ -0,0 +1,62 @@
++# Added in this project (2026-10-29, v4): height integrator.
++#
++# Why: v3 (retrained with the real-drone latency) corrects height about 6x more gently than v2, so that it does not
++#   oscillate under latency. The policy has no integral action, so any difference between the real hover thrust and
++#   the hover it "believes in" becomes a constant height offset: about 1.1 cm lower for every 1% of extra mass (v2:
++#   about 0.18 cm), and a heavy airframe stays 20 cm low for the whole 35 s. Integral action removes constant offsets
++#   without stronger corrections, and also handles every slowly changing thrust error (airframe mass, battery voltage
++#   sag, an inaccurate thrust curve).
++#
++# How: the mixed thrust command (the one env.step stores in self.actions) gets f_I added before the physics (or the
++#   latency model):
++#     f_I <- clamp(f_I + k_I*dt*clamp(H - z, -e_clip, e_clip), -f_max, f_max)
++#     z = the height observation the policy sees this step (with observation noise in training); no e_clip = no limit
++#     (a limit reduces wind-up when the start is far from the target)
++#     thrust sent = clamp(f + f_I, 0, 0.5)
++#   f_I = 0 at episode start; no accumulation during the first freeze_s seconds. The action in the policy observation
++#   excludes f_I (as without the integrator).
++#   orbit_policy/orbit_runtime.py does exactly the same on the drone (the bundle meta records k_I, f_max, freeze_s,
++#   e_clip and H).
++#
++# Settings (env_hyper.HEIGHT_INTEGRATOR): enabled (anything but True = no integrator, the environment is step for step
++#   unchanged), k_I [1/(m*s)], f_max, freeze_s, e_clip [m].
++# Differentiable (all torch ops, no in-place writes); detach_state() at the start of each BPTT segment; reset() zeroes it.
++import torch
++
++
++class HeightIntegrator:
++    def __init__(self, cfg, num_envs, device, dt, target_height):
++        self.cfg = dict(cfg)
++        self.k_I = float(cfg.get('k_I', 0.10))
++        self.f_max = float(cfg.get('f_max', 0.06))
++        self.freeze_s = float(cfg.get('freeze_s', 0.0))
++        e_clip = cfg.get('e_clip', None)
++        self.e_clip = None if e_clip is None else float(e_clip)
++        if self.k_I < 0 or self.f_max < 0 or self.freeze_s < 0 or (self.e_clip is not None and self.e_clip <= 0):
++            raise ValueError(f"HEIGHT_INTEGRATOR k_I, f_max and freeze_s must not be negative and e_clip must be > 0: {cfg}")
++        self.cfg.update(k_I=self.k_I, f_max=self.f_max, freeze_s=self.freeze_s, e_clip=self.e_clip)
++        self.dt = float(dt)
++        self.H = float(target_height)
++        self.f_I = torch.zeros(num_envs, device=device)
++
++    def reset(self, env_ids):
++        f = self.f_I.clone()                       # clone before writing: the old tensor may already be in the graph
++        f[env_ids] = 0.0
++        self.f_I = f
++
++    def detach_state(self):
++        self.f_I = self.f_I.detach().clone()
++
++    def apply(self, command, z_obs, step_count):
++        """command: this step's mixed command (N, 4) (3 body rates + thrust fraction f). Returns a new tensor for the physics; command is not modified.
++        z_obs: the height the policy sees this step (N,); step_count: steps since the episode start, progress_buf (N,)."""
++        e = self.H - z_obs
++        if self.e_clip is not None:
++            e = torch.clamp(e, -self.e_clip, self.e_clip)
++        upd = torch.clamp(self.f_I + self.k_I * self.dt * e, -self.f_max, self.f_max)
++        if self.freeze_s > 0.0:
++            active = (step_count.to(torch.float32) * self.dt) >= self.freeze_s
++            upd = torch.where(active, upd, self.f_I)
++        self.f_I = upd
++        thrust = torch.clamp(command[:, 3] + self.f_I, 0.0, 0.5)
++        return torch.cat([command[:, 0:3], thrust.unsqueeze(1)], dim=1)
+diff --git a/envs/assets/quadrotor_dynamics_advanced.py b/envs/assets/quadrotor_dynamics_advanced.py
+index 6254726..d0cd2a3 100644
+--- a/envs/assets/quadrotor_dynamics_advanced.py
++++ b/envs/assets/quadrotor_dynamics_advanced.py
+@@ -71,15 +71,24 @@ class QuadrotorSimulator:
+ 
+         R = torch.zeros((batch_size, 3, 3), device=self.device)
+ 
++        # NOTE: upstream bug fix (changed in this project)
++        #   [0,2] used to be 2*(x*z - w*y) and [2,0] 2*(x*z + w*y): the sign of w*y was swapped.
++        #   Effect: pure yaw and pure roll were still right, but pure pitch was fully reversed,
++        #   and any combined rotation did not even give a rotation matrix
++        #   (measured for a combined rotation: |R R^T - I| = 0.42, det = 0.76).
++        #   This is not a convention difference -- in any convention a rotation matrix is orthogonal with det = 1.
++        #   utils/gs_local.py:200-204 in the same repo has the same formula, correctly,
++        #   for comparison. After the fix, pure yaw / pure roll / pure pitch and a combined rotation all match
++        #   scipy.spatial.transform.Rotation (difference ~1e-16).
+         R[:, 0, 0] = 1 - 2 * (y**2 + z**2)
+         R[:, 0, 1] = 2 * (x*y - w*z)
+-        R[:, 0, 2] = 2 * (x*z - w*y)
++        R[:, 0, 2] = 2 * (x*z + w*y)      # was: 2 * (x*z - w*y)
+ 
+         R[:, 1, 0] = 2 * (x*y + w*z)
+         R[:, 1, 1] = 1 - 2 * (x**2 + z**2)
+         R[:, 1, 2] = 2 * (y*z - w*x)
+ 
+-        R[:, 2, 0] = 2 * (x*z + w*y)
++        R[:, 2, 0] = 2 * (x*z - w*y)      # was: 2 * (x*z + w*y)
+         R[:, 2, 1] = 2 * (y*z + w*x)
+         R[:, 2, 2] = 1 - 2 * (x**2 + y**2)
+ 
+@@ -109,16 +118,24 @@ class QuadrotorSimulator:
+         q_new = q_new / q_new.norm(dim=1, keepdim=True)
+         return q_new
+ 
+-    def update(self, position, velocity, orientation, angular_velocity, omega_desired_body, thrust, motor_speeds):
++    def update(self, position, velocity, orientation, angular_velocity, omega_desired_body, thrust, motor_speeds,
++               thrust_force=None):
+         """
+         Update the quadrotor's state.
++
++        thrust_force (added in this project, 2026-10-19): if given, used directly as the thrust magnitude (newtons, (batch,)) instead of thrust x max_thrust;
++        thrust noise is added as before (thrust_noise x max_thrust). Used by the motor response in envs/assets/command_latency.py.
++        When not given (default None) the behaviour is exactly as before.
+         """
+         batch_size = position.shape[0]
+ 
+         # Apply rotor control noise
+         if self.rotor_noise_std is not None:
+             thrust_noise = torch.randn_like(thrust) * self.rotor_noise_std
+-        actual_thrust = (thrust + thrust_noise) * self.max_thrust.clone()
++        if thrust_force is None:
++            actual_thrust = (thrust + thrust_noise) * self.max_thrust.clone()
++        else:
++            actual_thrust = thrust_force + thrust_noise * self.max_thrust.clone()
+ 
+         # Apply body rate noise
+         if self.br_noise_std is not None:
+diff --git a/envs/drone_long_traj.py b/envs/drone_long_traj.py
+index 9782757..2eb7469 100644
+--- a/envs/drone_long_traj.py
++++ b/envs/drone_long_traj.py
+@@ -4,7 +4,8 @@ torch.autograd.set_detect_anomaly(True)
+ 
+ from torchvision import models, transforms
+ from torchvision.transforms import Resize
+-from torchvision.io import write_video
++# torchvision 0.26 removed video I/O; use this project's replacement.
++from utils.video_io import write_video
+ import torch.nn as nn
+ import os
+ import sys
+@@ -70,24 +71,61 @@ class DroneLongTrajEnv(DFlexEnv):
+         maps = {
+             "gate_right":"sv_917_3_right_nerfstudio",
+             "gate_mid":"sv_1007_gate_mid",
++            # Scenes added by this project. Values are .ply file names under envs/assets/point_cloud/ (no extension).
++            # The scene frame is the point-cloud frame, so gs_origin_offset and
++            # point_could_origin_offset are both [0,0,0].
++            "scene04": "scene04",
+         }
+         self.map_name = map_name
+ 
+         # SysID value
+-        self.min_mass = 1.0
+-        self.mass_range = 0.2
+-        self.min_thrust = 24.0
+-        self.thrust_range = 4.0
++        # ================= This project's airframe (adapted from the original drone 'carl') =================
++        # Sources: measurements and spec sheets of the real drone, summarised below.
++        # Platform: EA4014 KV370 x4 (replaced the EA4008 after a crash on 8/27; ESCs recalibrated) + 1355 props (13x5.5)
++        #   + 6S 6300 mAh
++        #   + Pixhawk 6X + Jetson Orin Nano + Gemini 2, 600 mm wheelbase. The original carl values are kept in comments.
++        #
++        # Mass (2026-09-21): not weighed; sum of the part specs 3.04~3.26 kg, nominal 3.15 kg.
++        #   Main items: battery ~930 g, motors 165 g x4, frame 675~690 g, Jetson 176 g, ESCs 44 g x4.
++        # Thrust (2026-09-21): set by the thrust-to-weight ratio, since the simulated translation only depends on thrust/mass.
++        #   thrust-to-weight = (1/hover throttle)^p, no mass needed:
++        #   - hover throttle: hover thrust estimate 0.639~0.682 in the flight logs of 9/14 (ULog #100~104)
++        #     (battery 23.4~22.4 V), after the motor change; PX4 THR_MDL_FAC=0, MC_BAT_SCALE_EN=0
++        #   - p: motor model fitted to the EA4014 KV370 manufacturer's 6S thrust tables (four tables, 15~18 inch props),
++        #     scaled to 13 inch: p(65%->100%) = 1.64~1.74 (checked 16->15 inch on the same prop line: thrust error -1~+2%)
++        #   -> thrust-to-weight 1.87~2.18 (with battery voltage), nominal 2.05; total thrust 2.05 x 3.15 kg = 6.46 kgf = 63.4 N.
++        #   Cross-check: UC-series prop coefficients predict a 3.15 kg hover throttle of 0.62~0.63, measured 0.64~0.68,
++        #   about 7% thrust apart (arm blockage, hot-air density): consistent; the UP series predicts 0.50~0.55: inconsistent.
++        #   The absolute thrust of 13 inch props varies +-15% with the prop type, so it is not used.
++        #   NOTE: the max_thrust parameter = 2 x the real total thrust, because the env limits the thrust command to [0,0.5]
++        #     (see the thrust_col line below). The usable total thrust is half this value.
++        # Inertia / Kp / Kd: per-component estimate from the EA4008 build; the heavier motors should add 35~50% inertia, but
++        #   the closed-loop body-rate time constant is tau = (I + Kd) / Kp and Kp was derived from tau = 0.025 s,
++        #   so scaling inertia and Kp together changes nothing; left as is. tau = 25 ms itself is an assumption
++        #   (the existing flight logs do not excite it enough to measure it). The original uses tau = 0.011 s on all axes.
++        # Delay: 13 inch props have more rotational inertia; motor response about 52 ms (original about 42 ms), assumed.
++        # Check: python tools/verify_dynamics.py --mass 3.15 --max-thrust 126.75 \
++        #         --inertia 0.038 0.040 0.070 --tau-rate 0.025 \
++        #         --br-delay 0.70 --thrust-delay 0.62 --cross-area 0.25
++        # ============================================================
++        self.min_mass = 2.95          # carl: 1.0   (3.15 kg +-0.2, 2.95 ~ 3.35 kg; old EA4008 estimate 2.25)
++        self.mass_range = 0.40        # carl: 0.2
++        self.min_thrust = 111.0       # carl: 24.0  (parameter 111.0 ~ 142.5 N = real 55.5 ~ 71.3 N)
++        self.thrust_range = 31.5      # carl: 4.0   (nominal 126.75 -> real 63.4 N, thrust-to-weight 2.05; old 103.4 / 36.5)
+         self.obs_noise_level = 0.1
+-        self.br_delay_factor = 0.8
+-        self.thrust_delay_factor = 0.7
++        self.br_delay_factor = 0.70   # carl: 0.8   (tau 31ms -> 42ms)
++        self.thrust_delay_factor = 0.62  # carl: 0.7  (tau 42ms -> 52ms)
+         self.br_action_strength = 0.5
+         self.thrust_action_strength = 0.25
+         self.start_height = 1.25
+         self.target_height = 1.3
+-        self.init_inertia = [0.01, 0.012, 0.025]
+-        self.init_kp = [1.0, 1.2, 2.5]
+-        self.init_kd = [0.001, 0.001, 0.002]
++        self.init_inertia = [0.038, 0.040, 0.070]   # carl: [0.01, 0.012, 0.025]
++        self.init_kp = [1.642, 1.728, 3.024]        # carl: [1.0, 1.2, 2.5]
++        self.init_kd = [0.00304, 0.00320, 0.00560]  # carl: [0.001, 0.001, 0.002]
++
++        # ---- Scene-dependent take-off height (must be set before init_sim()) ----
++        if self.map_name == 'scene04':
++            self.start_height = 1.4     # same as the cruise height of the long patrol route
+ 
+         # GS model
+         gs_dir = Path("assets/gs_data")
+@@ -96,8 +134,13 @@ class DroneLongTrajEnv(DFlexEnv):
+ 
+         self.init_sim()
+         self.episode_length = episode_length
+-        self.gs_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); 3DGS origin on the room center, in training, we set the traj start as origin
+-        self.point_could_origin_offset = torch.tensor([[-6.0, 0., 0.]] * self.num_envs, device=self.device) # (x,y,z); point cloud origin on the room center, in training, we set the traj start as origin
++        # The original puts the training-frame origin at the take-off point and converts to the cloud/3DGS frame with this offset.
++        # scene04 uses training frame = point-cloud frame (all offsets 0), one less conversion to get backwards:
++        # reward_wp, traj_start and start_pos all use the same scene coordinates
++        # and can be checked directly with tools/validate_scene.py.
++        _off = [0.0, 0.0, 0.0] if self.map_name == 'scene04' else [-6.0, 0., 0.]
++        self.gs_origin_offset = torch.tensor([_off] * self.num_envs, device=self.device) # (x,y,z)
++        self.point_could_origin_offset = torch.tensor([_off] * self.num_envs, device=self.device) # (x,y,z)
+ 
+         # setup point cloud
+         script_dir = Path(__file__).parent
+@@ -105,14 +148,38 @@ class DroneLongTrajEnv(DFlexEnv):
+         ply_file = point_cloud_dir / f"{maps[self.map_name]}.ply"
+         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+ 
+ 
+         # Set up navigation goals
+-        if self.map_name == 'gate_mid':
++        if self.map_name == 'scene04':
++            # Long patrol route: from the west end of the corridor to the east end, passing the box in the middle on the right.
++            # Coordinates are point-cloud coordinates (see _off above). The clearance of every point was checked with
++            # the statistics of tools/prepare_pointcloud.py and with validate_scene.py;
++            # airframe safety radius 0.465 m, minimum clearance 1.03 m.
++            self.reward_wp = torch.tensor([
++                                        [-14.0,  2.0, 1.4],
++                                        [ -9.0,  1.0, 1.4],
++                                        [ -4.0, -2.0, 1.4],
++                                        [ -0.8, -2.5, 1.4],   # passage right of the box
++                                        [  3.0, -1.0, 1.4],
++                                        [  8.0,  0.0, 1.4],   # goal
++                                        ], device=self.device) # (x,y,z)
++
++            traj_wp = self.reward_wp + self.point_could_origin_offset[0].repeat((self.reward_wp.shape[0],1))
++            traj_start = torch.tensor([[-18.0, 2.0, 1.4]], device=self.device)
++            traj_dest = torch.tensor([[8.0, 0.0, 1.4]], device=self.device)
++            self.ref_traj = self.traj_planner.plan_trajectories(traj_start, traj_dest, [traj_wp])
++            if self.ref_traj is None or len(self.ref_traj) == 0 or self.ref_traj[0] is None:
++                raise RuntimeError(f"Path planning returned None for map '{self.map_name}': start or dest is likely inside occupied space. Run tools/validate_scene.py to check coordinates before training.")
++            self.ref_traj = torch.tensor(self.ref_traj[0], device = self.device)
++            self.target = self.reward_wp[-1].repeat((self.num_envs,1))
++            self.target_xy = self.reward_wp[-1, 0:2].repeat((self.num_envs,1))
++
++        elif self.map_name == 'gate_mid':
+             self.reward_wp = torch.tensor([
+                                         [5.8, -0.1, 1.6],
+                                         [7.6, 0.7, 1.3],
+@@ -163,7 +230,26 @@ class DroneLongTrajEnv(DFlexEnv):
+         
+         
+         # Reward parameters
+-        if self.map_name == 'gate_mid':
++        if self.map_name == 'scene04':
++            # Weights from gate_mid. The 27 m route is 1.5x as long as gate_mid's,
++            # so survive_reward is scaled by the same factor to keep "survive to the end" balanced against the other terms.
++            self.survive_reward = 12.0        # gate_mid: 8.0
++            # dynamics
++            self.lin_vel_penalty = -2.0
++            self.action_penalty = -1.0
++            self.action_change_penalty = -1.0
++            self.smooth_penalty = -1.0
++            self.pose_penalty = -0.5
++            self.height_penalty = -2.0
++            # trajectory
++            self.heading_strength = 0.5
++            self.waypoint_strength = 4.0
++            self.target_factor = -4.0
++            self.out_map_penalty = -1.5
++            # obstacle avoidance
++            self.obstacle_strength = 1.0
++
++        elif self.map_name == 'gate_mid':
+             self.survive_reward = 8.0
+             # dynamics
+             self.lin_vel_penalty = -2.0
+@@ -203,14 +289,30 @@ class DroneLongTrajEnv(DFlexEnv):
+ 
+         
+         # Navigation parameters
+-        self.obst_threshold = 0.5
+-        self.obst_collision_limit = 0.20
++        # ---- Safety envelope (this airframe) ----------------------------------
++        # The simulator treats the drone as a point with no collision volume. All obstacle distances are
++        # from the body centre to the nearest cloud point, so these thresholds must include the airframe radius.
++        #   safety radius = wheelbase/2 (0.30 m) + 13 inch prop radius (0.165 m) = 0.465 m
++        #   tip-to-tip width = 0.93 m
++        # The original carl has a radius of about 0.25 m and a 0.5 m threshold (about 2x); same ratio here.
++        # scene04 measured: median clearance at flight height 0.78 m, maximum 1.51 m: the airframe fits;
++        # with safety_distance=0.65 the largest connected free area for A* is still 32 x 16.4 m.
++        self.obst_threshold = 0.95        # carl: 0.5  (0.465 radius + 0.485 reaction margin)
++        self.obst_collision_limit = 0.50  # carl: 0.20 (slightly above the 0.465 physical radius)
++        # ---------------------------------------------------------
+         self.body_rate_threshold = 15
+         self.domain_randomization = False
+ 
+         self.map_limit_fact = 1.25
+-        self.map_x_min = -1.5; self.map_x_max = 13
+-        self.map_y_min = -2.5; self.map_y_max = 2.5
++        if self.map_name == 'scene04':
++            # Corridor bounds. y only +-4, because the capture path covers only y[-4.09, 3.83];
++            # beyond it the cloud is sparse -- the "large clearance" there is missing data, not open space,
++            # and would make the obstacle reward call it safe.
++            self.map_x_min = -20.0; self.map_x_max = 10.0
++            self.map_y_min = -4.0;  self.map_y_max = 4.0
++        else:
++            self.map_x_min = -1.5; self.map_x_max = 13
++            self.map_y_min = -2.5; self.map_y_max = 2.5
+ 
+         self.gs_count = 0
+         self.gs_freq = 1 # 3D GS inference frequency
+@@ -296,7 +398,12 @@ class DroneLongTrajEnv(DFlexEnv):
+         self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+         self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+ 
+-        if self.map_name == 'gate_mid':
++        if self.map_name == 'scene04':
++            # Identity quaternion = yaw 0. Rendering negates yaw (see the comment on pose2nerf_transform
++            # in utils/gs_local.py); yaw 0 negated is still 0,
++            # so the nose points along world +x, the direction of the corridor.
++            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
++        elif self.map_name == 'gate_mid':
+             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+         elif self.map_name == 'gate_right':
+             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+@@ -315,7 +422,8 @@ class DroneLongTrajEnv(DFlexEnv):
+         self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
+         inertia = torch.tensor(self.init_inertia, device=self.device)  # Diagonal inertia components
+         self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
+-        link_length = 0.15  # meters
++        link_length = 0.30  # meters (half the measured 600 mm wheelbase)
++        # Note: QuadrotorSimulator only stores it as self.l and never uses it; changing it has no effect.
+         Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+         Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+ 
+@@ -333,7 +441,10 @@ class DroneLongTrajEnv(DFlexEnv):
+             br_noise_std=0.01
+         )
+         
+-        if self.map_name == 'gate_mid':
++        if self.map_name == 'scene04':
++            start_pos_x = -18.0; start_pos_y = 2.0   # scene frame, clearance 1.51 m
++            self.start_body_rate = [0., 0., 0.]
++        elif self.map_name == 'gate_mid':
+             start_pos_x = 0.0; start_pos_y = 0.0
+             self.start_body_rate = [0., 0., 0.]
+         elif self.map_name == 'gate_right':
+diff --git a/envs/drone_multi_gate.py b/envs/drone_multi_gate.py
+index bd34998..2fdddca 100644
+--- a/envs/drone_multi_gate.py
++++ b/envs/drone_multi_gate.py
+@@ -4,7 +4,8 @@ torch.autograd.set_detect_anomaly(True)
+ 
+ from torchvision import models, transforms
+ from torchvision.transforms import Resize
+-from torchvision.io import write_video
++# torchvision 0.26 removed video I/O; use this project's replacement.
++from utils.video_io import write_video
+ import torch.nn as nn
+ import os
+ import sys
+@@ -71,6 +72,10 @@ class DroneMultiGateEnv(DFlexEnv):
+             "gate_left":"sv_917_3_left_nerfstudio",
+             "gate_right":"sv_917_3_right_nerfstudio",
+             "gate_mid":"sv_1007_gate_mid",
++            # Scenes added by this project. Values are .ply file names under envs/assets/point_cloud/ (no extension).
++            # The scene frame is the point-cloud frame, so gs_origin_offset and
++            # point_could_origin_offset are both [0,0,0].
++            "scene04": "scene04",
+         }
+         self.map_name = map_name
+         self.multi_map = ["gate_right", "gate_left", "gate_mid"]
+@@ -78,20 +83,49 @@ class DroneMultiGateEnv(DFlexEnv):
+         
+ 
+         # SysID value
+-        self.min_mass = 1.0
+-        self.mass_range = 0.2
+-        self.min_thrust = 24.0
+-        self.thrust_range = 4.0
++        # ================= This project's airframe (adapted from the original drone 'carl') =================
++        # Sources: measurements and spec sheets of the real drone, summarised below.
++        # Platform: EA4014 KV370 x4 (replaced the EA4008 after a crash on 8/27; ESCs recalibrated) + 1355 props (13x5.5)
++        #   + 6S 6300 mAh
++        #   + Pixhawk 6X + Jetson Orin Nano + Gemini 2, 600 mm wheelbase. The original carl values are kept in comments.
++        #
++        # Mass (2026-09-21): not weighed; sum of the part specs 3.04~3.26 kg, nominal 3.15 kg.
++        #   Main items: battery ~930 g, motors 165 g x4, frame 675~690 g, Jetson 176 g, ESCs 44 g x4.
++        # Thrust (2026-09-21): set by the thrust-to-weight ratio, since the simulated translation only depends on thrust/mass.
++        #   thrust-to-weight = (1/hover throttle)^p, no mass needed:
++        #   - hover throttle: hover thrust estimate 0.639~0.682 in the flight logs of 9/14 (ULog #100~104)
++        #     (battery 23.4~22.4 V), after the motor change; PX4 THR_MDL_FAC=0, MC_BAT_SCALE_EN=0
++        #   - p: motor model fitted to the EA4014 KV370 manufacturer's 6S thrust tables (four tables, 15~18 inch props),
++        #     scaled to 13 inch: p(65%->100%) = 1.64~1.74 (checked 16->15 inch on the same prop line: thrust error -1~+2%)
++        #   -> thrust-to-weight 1.87~2.18 (with battery voltage), nominal 2.05; total thrust 2.05 x 3.15 kg = 6.46 kgf = 63.4 N.
++        #   Cross-check: UC-series prop coefficients predict a 3.15 kg hover throttle of 0.62~0.63, measured 0.64~0.68,
++        #   about 7% thrust apart (arm blockage, hot-air density): consistent; the UP series predicts 0.50~0.55: inconsistent.
++        #   The absolute thrust of 13 inch props varies +-15% with the prop type, so it is not used.
++        #   NOTE: the max_thrust parameter = 2 x the real total thrust, because the env limits the thrust command to [0,0.5]
++        #     (see the thrust_col line below). The usable total thrust is half this value.
++        # Inertia / Kp / Kd: per-component estimate from the EA4008 build; the heavier motors should add 35~50% inertia, but
++        #   the closed-loop body-rate time constant is tau = (I + Kd) / Kp and Kp was derived from tau = 0.025 s,
++        #   so scaling inertia and Kp together changes nothing; left as is. tau = 25 ms itself is an assumption
++        #   (the existing flight logs do not excite it enough to measure it). The original uses tau = 0.011 s on all axes.
++        # Delay: 13 inch props have more rotational inertia; motor response about 52 ms (original about 42 ms), assumed.
++        # Check: python tools/verify_dynamics.py --mass 3.15 --max-thrust 126.75 \
++        #         --inertia 0.038 0.040 0.070 --tau-rate 0.025 \
++        #         --br-delay 0.70 --thrust-delay 0.62 --cross-area 0.25
++        # ============================================================
++        self.min_mass = 2.95          # carl: 1.0   (3.15 kg +-0.2, 2.95 ~ 3.35 kg; old EA4008 estimate 2.25)
++        self.mass_range = 0.40        # carl: 0.2
++        self.min_thrust = 111.0       # carl: 24.0  (parameter 111.0 ~ 142.5 N = real 55.5 ~ 71.3 N)
++        self.thrust_range = 31.5      # carl: 4.0   (nominal 126.75 -> real 63.4 N, thrust-to-weight 2.05; old 103.4 / 36.5)
+         self.obs_noise_level = 0.05
+-        self.br_delay_factor = 0.8
+-        self.thrust_delay_factor = 0.7
++        self.br_delay_factor = 0.70   # carl: 0.8   (tau 31ms -> 42ms)
++        self.thrust_delay_factor = 0.62  # carl: 0.7  (tau 42ms -> 52ms)
+         self.br_action_strength = 0.5
+         self.thrust_action_strength = 0.25
+         self.start_height = 1.35
+         self.target_height = 1.40
+-        self.init_inertia = [0.01, 0.012, 0.025]
+-        self.init_kp = [1.0, 1.2, 2.5]
+-        self.init_kd = [0.001, 0.001, 0.002]
++        self.init_inertia = [0.038, 0.040, 0.070]   # carl: [0.01, 0.012, 0.025]
++        self.init_kp = [1.642, 1.728, 3.024]        # carl: [1.0, 1.2, 2.5]
++        self.init_kd = [0.00304, 0.00320, 0.00560]  # carl: [0.001, 0.001, 0.002]
+ 
+         self.init_sim()
+         self.episode_length = episode_length
+@@ -136,8 +170,17 @@ class DroneMultiGateEnv(DFlexEnv):
+ 
+ 
+         # Navigation parameters
+-        self.obst_threshold = 0.5
+-        self.obst_collision_limit = 0.20
++        # ---- Safety envelope (this airframe) ----------------------------------
++        # The simulator treats the drone as a point with no collision volume. All obstacle distances are
++        # from the body centre to the nearest cloud point, so these thresholds must include the airframe radius.
++        #   safety radius = wheelbase/2 (0.30 m) + 13 inch prop radius (0.165 m) = 0.465 m
++        #   tip-to-tip width = 0.93 m
++        # The original carl has a radius of about 0.25 m and a 0.5 m threshold (about 2x); same ratio here.
++        # scene04 measured: median clearance at flight height 0.78 m, maximum 1.51 m: the airframe fits;
++        # with safety_distance=0.65 the largest connected free area for A* is still 32 x 16.4 m.
++        self.obst_threshold = 0.95        # carl: 0.5  (0.465 radius + 0.485 reaction margin)
++        self.obst_collision_limit = 0.50  # carl: 0.20 (slightly above the 0.465 physical radius)
++        # ---------------------------------------------------------
+         self.body_rate_threshold = 15
+         self.domain_randomization = False
+ 
+@@ -249,7 +292,7 @@ class DroneMultiGateEnv(DFlexEnv):
+                 
+             # plane the global ref trajectory
+             traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+@@ -293,7 +336,8 @@ class DroneMultiGateEnv(DFlexEnv):
+         self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
+         inertia = torch.tensor(self.init_inertia, device=self.device)  # Diagonal inertia components
+         self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
+-        link_length = 0.15  # meters
++        link_length = 0.30  # meters (half the measured 600 mm wheelbase)
++        # Note: QuadrotorSimulator only stores it as self.l and never uses it; changing it has no effect.
+         Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+         Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+ 
+diff --git a/envs/drone_ppo.py b/envs/drone_ppo.py
+index bd2d9a6..e403cbd 100644
+--- a/envs/drone_ppo.py
++++ b/envs/drone_ppo.py
+@@ -4,7 +4,8 @@ torch.autograd.set_detect_anomaly(True)
+ 
+ from torchvision import models, transforms
+ from torchvision.transforms import Resize
+-from torchvision.io import write_video
++# torchvision 0.26 removed video I/O; use this project's replacement.
++from utils.video_io import write_video
+ import torch.nn as nn
+ import os
+ import sys
+@@ -70,24 +71,57 @@ class DronePPOEnv(DFlexEnv):
+         maps = {
+             "gate_right":"sv_917_3_right_nerfstudio",
+             "gate_mid":"sv_1007_gate_mid",
++            # Scenes added by this project. Values are .ply file names under envs/assets/point_cloud/ (no extension).
++            # The scene frame is the point-cloud frame, so gs_origin_offset and
++            # point_could_origin_offset are both [0,0,0].
++            "scene04": "scene04",
+         }
+         self.map_name = map_name
+ 
+         # SysID value
+-        self.min_mass = 1.0
+-        self.mass_range = 0.2
+-        self.min_thrust = 24.0
+-        self.thrust_range = 4.0
++        # ================= This project's airframe (adapted from the original drone 'carl') =================
++        # Sources: measurements and spec sheets of the real drone, summarised below.
++        # Platform: EA4014 KV370 x4 (replaced the EA4008 after a crash on 8/27; ESCs recalibrated) + 1355 props (13x5.5)
++        #   + 6S 6300 mAh
++        #   + Pixhawk 6X + Jetson Orin Nano + Gemini 2, 600 mm wheelbase. The original carl values are kept in comments.
++        #
++        # Mass (2026-09-21): not weighed; sum of the part specs 3.04~3.26 kg, nominal 3.15 kg.
++        #   Main items: battery ~930 g, motors 165 g x4, frame 675~690 g, Jetson 176 g, ESCs 44 g x4.
++        # Thrust (2026-09-21): set by the thrust-to-weight ratio, since the simulated translation only depends on thrust/mass.
++        #   thrust-to-weight = (1/hover throttle)^p, no mass needed:
++        #   - hover throttle: hover thrust estimate 0.639~0.682 in the flight logs of 9/14 (ULog #100~104)
++        #     (battery 23.4~22.4 V), after the motor change; PX4 THR_MDL_FAC=0, MC_BAT_SCALE_EN=0
++        #   - p: motor model fitted to the EA4014 KV370 manufacturer's 6S thrust tables (four tables, 15~18 inch props),
++        #     scaled to 13 inch: p(65%->100%) = 1.64~1.74 (checked 16->15 inch on the same prop line: thrust error -1~+2%)
++        #   -> thrust-to-weight 1.87~2.18 (with battery voltage), nominal 2.05; total thrust 2.05 x 3.15 kg = 6.46 kgf = 63.4 N.
++        #   Cross-check: UC-series prop coefficients predict a 3.15 kg hover throttle of 0.62~0.63, measured 0.64~0.68,
++        #   about 7% thrust apart (arm blockage, hot-air density): consistent; the UP series predicts 0.50~0.55: inconsistent.
++        #   The absolute thrust of 13 inch props varies +-15% with the prop type, so it is not used.
++        #   NOTE: the max_thrust parameter = 2 x the real total thrust, because the env limits the thrust command to [0,0.5]
++        #     (see the thrust_col line below). The usable total thrust is half this value.
++        # Inertia / Kp / Kd: per-component estimate from the EA4008 build; the heavier motors should add 35~50% inertia, but
++        #   the closed-loop body-rate time constant is tau = (I + Kd) / Kp and Kp was derived from tau = 0.025 s,
++        #   so scaling inertia and Kp together changes nothing; left as is. tau = 25 ms itself is an assumption
++        #   (the existing flight logs do not excite it enough to measure it). The original uses tau = 0.011 s on all axes.
++        # Delay: 13 inch props have more rotational inertia; motor response about 52 ms (original about 42 ms), assumed.
++        # Check: python tools/verify_dynamics.py --mass 3.15 --max-thrust 126.75 \
++        #         --inertia 0.038 0.040 0.070 --tau-rate 0.025 \
++        #         --br-delay 0.70 --thrust-delay 0.62 --cross-area 0.25
++        # ============================================================
++        self.min_mass = 2.95          # carl: 1.0   (3.15 kg +-0.2, 2.95 ~ 3.35 kg; old EA4008 estimate 2.25)
++        self.mass_range = 0.40        # carl: 0.2
++        self.min_thrust = 111.0       # carl: 24.0  (parameter 111.0 ~ 142.5 N = real 55.5 ~ 71.3 N)
++        self.thrust_range = 31.5      # carl: 4.0   (nominal 126.75 -> real 63.4 N, thrust-to-weight 2.05; old 103.4 / 36.5)
+         self.obs_noise_level = 0.1
+-        self.br_delay_factor = 0.8
+-        self.thrust_delay_factor = 0.7
++        self.br_delay_factor = 0.70   # carl: 0.8   (tau 31ms -> 42ms)
++        self.thrust_delay_factor = 0.62  # carl: 0.7  (tau 42ms -> 52ms)
+         self.br_action_strength = 0.5
+         self.thrust_action_strength = 0.25
+         self.start_height = 1.25
+         self.target_height = 1.3
+-        self.init_inertia = [0.01, 0.012, 0.025]
+-        self.init_kp = [1.0, 1.2, 2.5]
+-        self.init_kd = [0.001, 0.001, 0.002]
++        self.init_inertia = [0.038, 0.040, 0.070]   # carl: [0.01, 0.012, 0.025]
++        self.init_kp = [1.642, 1.728, 3.024]        # carl: [1.0, 1.2, 2.5]
++        self.init_kd = [0.00304, 0.00320, 0.00560]  # carl: [0.001, 0.001, 0.002]
+ 
+         # GS model
+         gs_dir = Path("assets/gs_data")
+@@ -105,7 +139,7 @@ class DronePPOEnv(DFlexEnv):
+         ply_file = point_cloud_dir / f"{maps[self.map_name]}.ply"
+         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+@@ -194,8 +228,17 @@ class DronePPOEnv(DFlexEnv):
+ 
+         
+         # Navigation parameters
+-        self.obst_threshold = 0.5
+-        self.obst_collision_limit = 0.20
++        # ---- Safety envelope (this airframe) ----------------------------------
++        # The simulator treats the drone as a point with no collision volume. All obstacle distances are
++        # from the body centre to the nearest cloud point, so these thresholds must include the airframe radius.
++        #   safety radius = wheelbase/2 (0.30 m) + 13 inch prop radius (0.165 m) = 0.465 m
++        #   tip-to-tip width = 0.93 m
++        # The original carl has a radius of about 0.25 m and a 0.5 m threshold (about 2x); same ratio here.
++        # scene04 measured: median clearance at flight height 0.78 m, maximum 1.51 m: the airframe fits;
++        # with safety_distance=0.65 the largest connected free area for A* is still 32 x 16.4 m.
++        self.obst_threshold = 0.95        # carl: 0.5  (0.465 radius + 0.485 reaction margin)
++        self.obst_collision_limit = 0.50  # carl: 0.20 (slightly above the 0.465 physical radius)
++        # ---------------------------------------------------------
+         self.body_rate_threshold = 15
+         self.domain_randomization = False
+ 
+@@ -298,7 +341,8 @@ class DronePPOEnv(DFlexEnv):
+         self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
+         inertia = torch.tensor(self.init_inertia, device=self.device)  # Diagonal inertia components
+         self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
+-        link_length = 0.15  # meters
++        link_length = 0.30  # meters (half the measured 600 mm wheelbase)
++        # Note: QuadrotorSimulator only stores it as self.l and never uses it; changing it has no effect.
+         Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+         Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+ 
+diff --git a/envs/drone_vla_long_task.py b/envs/drone_vla_long_task.py
+index 32ac86a..12b0fc8 100644
+--- a/envs/drone_vla_long_task.py
++++ b/envs/drone_vla_long_task.py
+@@ -12,7 +12,8 @@ import torch
+ torch.autograd.set_detect_anomaly(True)
+ 
+ from torchvision.transforms import Resize
+-from torchvision.io import write_video
++# torchvision 0.26 removed video I/O; use this project's replacement.
++from utils.video_io import write_video
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import os
+@@ -84,22 +85,57 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         # setup map
+         maps = {
+             "gate_mid_new": "gate_mid_new",
++            # Scenes added by this project. Values are .ply file names under envs/assets/point_cloud/ (no extension).
++            # The scene frame is the point-cloud frame, so gs_origin_offset and
++            # point_could_origin_offset are both [0,0,0].
++            "scene04": "scene04",
+         }
+         self.map_name = map_name
+ 
+         # SysID value
+-        self.min_mass = 1.0
+-        self.mass_range = 0.2
+-        self.min_thrust = 24.0
+-        self.thrust_range = 4.0
++        # ================= This project's airframe (adapted from the original drone 'carl') =================
++        # Sources: measurements and spec sheets of the real drone, summarised below.
++        # Platform: EA4014 KV370 x4 (replaced the EA4008 after a crash on 8/27; ESCs recalibrated) + 1355 props (13x5.5)
++        #   + 6S 6300 mAh
++        #   + Pixhawk 6X + Jetson Orin Nano + Gemini 2, 600 mm wheelbase. The original carl values are kept in comments.
++        #
++        # Mass (2026-09-21): not weighed; sum of the part specs 3.04~3.26 kg, nominal 3.15 kg.
++        #   Main items: battery ~930 g, motors 165 g x4, frame 675~690 g, Jetson 176 g, ESCs 44 g x4.
++        # Thrust (2026-09-21): set by the thrust-to-weight ratio, since the simulated translation only depends on thrust/mass.
++        #   thrust-to-weight = (1/hover throttle)^p, no mass needed:
++        #   - hover throttle: hover thrust estimate 0.639~0.682 in the flight logs of 9/14 (ULog #100~104)
++        #     (battery 23.4~22.4 V), after the motor change; PX4 THR_MDL_FAC=0, MC_BAT_SCALE_EN=0
++        #   - p: motor model fitted to the EA4014 KV370 manufacturer's 6S thrust tables (four tables, 15~18 inch props),
++        #     scaled to 13 inch: p(65%->100%) = 1.64~1.74 (checked 16->15 inch on the same prop line: thrust error -1~+2%)
++        #   -> thrust-to-weight 1.87~2.18 (with battery voltage), nominal 2.05; total thrust 2.05 x 3.15 kg = 6.46 kgf = 63.4 N.
++        #   Cross-check: UC-series prop coefficients predict a 3.15 kg hover throttle of 0.62~0.63, measured 0.64~0.68,
++        #   about 7% thrust apart (arm blockage, hot-air density): consistent; the UP series predicts 0.50~0.55: inconsistent.
++        #   The absolute thrust of 13 inch props varies +-15% with the prop type, so it is not used.
++        #   NOTE: the max_thrust parameter = 2 x the real total thrust, because the env limits the thrust command to [0,0.5]
++        #     (see the thrust_col line below). The usable total thrust is half this value.
++        # Inertia / Kp / Kd: per-component estimate from the EA4008 build; the heavier motors should add 35~50% inertia, but
++        #   the closed-loop body-rate time constant is tau = (I + Kd) / Kp and Kp was derived from tau = 0.025 s,
++        #   so scaling inertia and Kp together changes nothing; left as is. tau = 25 ms itself is an assumption
++        #   (the existing flight logs do not excite it enough to measure it). The original uses tau = 0.011 s on all axes.
++        # Delay: 13 inch props have more rotational inertia; motor response about 52 ms (original about 42 ms), assumed.
++        # Check: python tools/verify_dynamics.py --mass 3.15 --max-thrust 126.75 \
++        #         --inertia 0.038 0.040 0.070 --tau-rate 0.025 \
++        #         --br-delay 0.70 --thrust-delay 0.62 --cross-area 0.25
++        # ============================================================
++        self.min_mass = 2.95          # carl: 1.0   (3.15 kg +-0.2, 2.95 ~ 3.35 kg; old EA4008 estimate 2.25)
++        self.mass_range = 0.40        # carl: 0.2
++        self.min_thrust = 111.0       # carl: 24.0  (parameter 111.0 ~ 142.5 N = real 55.5 ~ 71.3 N)
++        self.thrust_range = 31.5      # carl: 4.0   (nominal 126.75 -> real 63.4 N, thrust-to-weight 2.05; old 103.4 / 36.5)
+         self.obs_noise_level = 0.1
+-        self.br_delay_factor = 0.8
+-        self.thrust_delay_factor = 0.7
++        self.br_delay_factor = 0.70   # carl: 0.8   (tau 31ms -> 42ms)
++        self.thrust_delay_factor = 0.62  # carl: 0.7  (tau 42ms -> 52ms)
+         self.start_height = 1.25
++        if self.map_name == 'scene04':
++            self.start_height = 1.4     # same as the cruise height of the long patrol route
+         self.target_height = 1.3
+-        self.init_inertia = [0.01, 0.012, 0.025]
+-        self.init_kp = [1.0, 1.2, 2.5]
+-        self.init_kd = [0.001, 0.001, 0.002]
++        self.init_inertia = [0.038, 0.040, 0.070]   # carl: [0.01, 0.012, 0.025]
++        self.init_kp = [1.642, 1.728, 3.024]        # carl: [1.0, 1.2, 2.5]
++        self.init_kd = [0.00304, 0.00320, 0.00560]  # carl: [0.001, 0.001, 0.002]
+ 
+         # GS model
+         gs_dir = Path("assets/gs_data")
+@@ -110,7 +146,10 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         self.episode_length = episode_length
+ 
+         # navigation parameters
+-        if self.map_name == 'gate_mid_new':
++        if self.map_name == 'scene04':
++            target = (8.0, 0.0, 1.4)          # east end of the corridor, scene frame
++            target_xy = (8.0, 0.0)
++        elif self.map_name == 'gate_mid_new':
+             target = (13.0, -2.0, 1.5) # in map absolute dimension, start with 0
+             target_xy = (13.0, -2.0)
+         else:
+@@ -120,8 +159,10 @@ class DroneVLALongTaskEnv(DFlexEnv):
+             device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+         self.target_xy = tu.to_torch(list(target_xy), 
+             device=self.device, requires_grad=True).repeat((self.num_envs, 1)) # navigation target
+-        self.gs_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); gs dimension for visual info
+-        self.point_could_origin_offset = torch.tensor([[-6.0, -0., -0.05]] * self.num_envs, device=self.device) # (x,y,z); point cloud dimension for obstacle distance & traj plan
++        # scene04 uses training frame = point-cloud frame (all offsets 0): one less conversion to get backwards.
++        _off = [0.0, 0.0, 0.0] if self.map_name == 'scene04' else [-6.0, -0., -0.05]
++        self.gs_origin_offset = torch.tensor([_off] * self.num_envs, device=self.device) # (x,y,z)
++        self.point_could_origin_offset = torch.tensor([_off] * self.num_envs, device=self.device) # (x,y,z)
+ 
+         # setup point cloud
+         script_dir = Path(__file__).parent
+@@ -129,15 +170,50 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         ply_file = point_cloud_dir / f"{maps[self.map_name]}.ply"
+         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+         
+ 
+         # generate ref_traj
+-        if self.map_name == 'gate_mid_new':
+-            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
++        if self.map_name == 'scene04':
++            self.traj_start = torch.tensor([[-18.0, 2.0, 1.4]], device=self.device)
++            self.wp_num = 4
++            self.ref_traj_size = 24        # the route is 28 m, longer than gate_mid_new: more samples
++
++            # The three tasks share one corridor and differ only in how they pass the box in the middle.
++            # Waypoint 1 is shared (middle of the corridor), waypoint 2 is where they split (at the box),
++            # waypoint 3 rejoins after the box, waypoint 4 is the common goal.
++            # Box: centre (-0.77, -0.01), 1.82 x 1.81 m footprint, 1.57 m tall (z 0.30~1.87).
++            # Clearance 1.18 m on the right, 1.06 m on the left; passing above needs z >= 2.4 m.
++            # All waypoints checked: minimum clearance 0.86 m > airframe radius 0.465 m.
++            self.task_table = {
++                "[Task 0] FLY passed the RIGHT side of the box": [torch.tensor([
++                                                                [ -9.0,  1.0, 1.4],
++                                                                [ -0.8, -2.5, 1.4],
++                                                                [  3.0, -1.0, 1.4],
++                                                                [  8.0,  0.0, 1.4],
++                                                                ], device=self.device)
++                                                    ],
++                "[Task 1] FLY passed the LEFT side of the box": [torch.tensor([
++                                                                [ -9.0,  1.0, 1.4],
++                                                                [ -0.8,  2.2, 1.4],
++                                                                [  3.0,  1.0, 1.4],
++                                                                [  8.0,  0.0, 1.4],
++                                                                ], device=self.device)
++                                                    ],
++                "[Task 2] FLY ABOVE the box": [torch.tensor([
++                                                                [ -9.0,  1.0, 1.4],
++                                                                [ -0.8,  0.0, 2.6],
++                                                                [  3.0,  0.0, 1.8],
++                                                                [  8.0,  0.0, 1.4],
++                                                                ], device=self.device)
++                                                    ],
++            }
++
++        elif self.map_name == 'gate_mid_new':
++            self.traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
+             self.wp_num = 3
+             self.ref_traj_size = 20
+             self.task_table = {
+@@ -225,8 +301,13 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         for key, value in self.task_table.items():
+             reward_wp = value[0]
+             traj_wp = reward_wp + self.point_could_origin_offset[0].repeat((reward_wp.shape[0],1))
+-            traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
+-            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(traj_start, 
++            # NOTE: upstream bug fix (changed in this project)
++            #   This used to hard-code traj_start = [[-6.0, 0, 1.4]], overwriting the start point set
++            #   in each scene branch, so the branch's traj_start was dead code.
++            #   The original only has the gate_mid_new scene, whose start happens to be -6,0,1.4,
++            #   so the bug never showed. With another scene the reference trajectory
++            #   starts from the wrong place -- without any error.
++            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(self.traj_start, 
+                                                                                             [traj_wp], 
+                                                                                             des_wp_num=self.ref_traj_size)[0], 
+                                                     device=self.device))
+@@ -260,7 +341,35 @@ class DroneVLALongTaskEnv(DFlexEnv):
+             self.reward_wp_record.append(torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+         
+         # Reward parameters
+-        if self.map_name == 'gate_mid_new':
++        if self.map_name == 'scene04':
++            # Weights from gate_mid_new; the 28 m route is about 1.5x as long,
++            # so survive_reward is scaled by the same factor to keep the terms' relative weights.
++            self.up_strength = 0.25
++            self.heading_strength = 0.3
++            self.lin_strength = -0.5
++            self.lin_vel_rate_penalty = -0.75
++            self.action_penalty = -1.0
++            self.action_change_penalty = -1.0
++            self.smooth_penalty = -0.75
++            self.survive_reward = 12.0        # gate_mid_new: 8.0
++            self.pose_penalty = -0.5
++            self.height_penalty = -1.5
++            self.height_change_penalty = -0.5
++            self.jitter_penalty = -0.1
++            self.out_map_penalty = -1.5
++            self.map_center_penalty = -0.05
++            # trajectory
++            self.waypoint_strength = 4.0
++            self.target_factor = -4.0
++            # obstacle avoidance
++            self.obstacle_strength = 1.0
++            self.collision_penalty_coef = 0.0
++            # The collision penalty is the coefficient times survive_reward; without this line
++            # building the hyper_parameter dict below raises AttributeError.
++            # A coefficient of 0.0 means the collision penalty is off (as in the original).
++            self.collision_penalty = self.collision_penalty_coef*self.survive_reward
++
++        elif self.map_name == 'gate_mid_new':
+             self.up_strength = 0.25
+             self.heading_strength = 0.3 # reward yaw motion align with lin_vel
+             self.lin_strength = -0.5
+@@ -286,16 +395,31 @@ class DroneVLALongTaskEnv(DFlexEnv):
+             raise ValueError(f"Unknown map name: {self.map_name}")
+         
+        
+-        self.obst_threshold = 0.5
+-        self.obst_collision_limit = 0.20
++        # ---- Safety envelope (this airframe) ----------------------------------
++        # The simulator treats the drone as a point with no collision volume. All obstacle distances are
++        # from the body centre to the nearest cloud point, so these thresholds must include the airframe radius.
++        #   safety radius = wheelbase/2 (0.30 m) + 13 inch prop radius (0.165 m) = 0.465 m
++        #   tip-to-tip width = 0.93 m
++        # The original carl has a radius of about 0.25 m and a 0.5 m threshold (about 2x); same ratio here.
++        # scene04 measured: median clearance at flight height 0.78 m, maximum 1.51 m: the airframe fits;
++        # with safety_distance=0.65 the largest connected free area for A* is still 32 x 16.4 m.
++        self.obst_threshold = 0.95        # carl: 0.5  (0.465 radius + 0.485 reaction margin)
++        self.obst_collision_limit = 0.50  # carl: 0.20 (slightly above the 0.465 physical radius)
++        # ---------------------------------------------------------
+         self.body_rate_threshold = 15
+         self.domain_randomization = False
+ 
+ 
+         # self.dt = 0.05 # outter loop RL policy freaquency
+         self.map_limit_fact = 1.25
+-        self.map_x_min = -1.5; self.map_x_max = 13
+-        self.map_y_min = -2.5; self.map_y_max = 2.5
++        if self.map_name == 'scene04':
++            # y only +-4: the capture path covers only y[-4.09, 3.83]; beyond it the cloud is sparse,
++            # and the "large clearance" there is missing data, not open space; obstacle avoidance would call it safe.
++            self.map_x_min = -20.0; self.map_x_max = 10.0
++            self.map_y_min = -4.0;  self.map_y_max = 4.0
++        else:
++            self.map_x_min = -1.5; self.map_x_max = 13
++            self.map_y_min = -2.5; self.map_y_max = 2.5
+         
+ 
+         self.nerf_count = 0
+@@ -431,7 +555,9 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+         self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
+ 
+-        if self.map_name == 'gate_mid_new':
++        if self.map_name == 'scene04':
++            self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w); nose along +x
++        elif self.map_name == 'gate_mid_new':
+             self.start_rot = np.array([0., 0., 0., 1.]) # (x,y,z,w)
+         else:
+             raise ValueError(f"Unknown map name: {self.map_name}")
+@@ -443,12 +569,13 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
+ 
+         # Initialize the drone dynamics parameters
+-        self.mass = torch.full((self.num_envs,), self.min_mass+0.5*self.mass_range, device=self.device)  # All drones have mass = 1.2 kg
+-        self.max_thrust = torch.full((self.num_envs,), self.min_thrust+0.5*self.thrust_range, device=self.device)  # All drones have max_thrust = 23 N
++        self.mass = torch.full((self.num_envs,), self.min_mass+0.5*self.mass_range, device=self.device)  # nominal 3.15 kg
++        self.max_thrust = torch.full((self.num_envs,), self.min_thrust+0.5*self.thrust_range, device=self.device)  # nominal 126.75 N parameter = 63.4 N real total thrust
+         self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
+         inertia = torch.tensor(self.init_inertia, device=self.device)  # Diagonal inertia components
+         self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
+-        link_length = 0.15  # meters
++        link_length = 0.30  # meters (half the measured 600 mm wheelbase)
++        # Note: QuadrotorSimulator only stores it as self.l and never uses it; changing it has no effect.
+         Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+         Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+ 
+@@ -467,7 +594,10 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         )
+         
+         # set start pos
+-        if self.map_name == 'gate_mid_new':
++        if self.map_name == 'scene04':
++            start_pos_x = -18.0; start_pos_y = 2.0   # scene frame, clearance 1.51 m
++            self.start_body_rate = [0., 0., 0.]
++        elif self.map_name == 'gate_mid_new':
+             start_pos_x = 0.0; start_pos_y = 0.0
+             self.start_body_rate = [0., 0., 0.]
+         else:
+@@ -564,14 +694,33 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         
+         # Core dynamic simulation
+         self.time_report.start_timer("dynamic simulation")
+-        new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = \
+-        self.quad_dynamics.run_simulation(
++        # Added in this project (2026-10-19): command latency + motor response of the thrust (envs/assets/command_latency.py).
++        # Only DroneVLAOrbitEnv with LATENCY_MODEL enabled in env_hyper has cmd_latency; otherwise the original call runs unchanged.
++        cmd_latency = getattr(self, 'cmd_latency', None)
++        # Added in this project (2026-10-29, v4): height integrator (envs/assets/height_integrator.py). f_I is added to the thrust before the physics;
++        # self.actions (used in the observation) excludes f_I. Only DroneVLAOrbitEnv with HEIGHT_INTEGRATOR enabled has one; otherwise unchanged.
++        height_int = getattr(self, 'height_integrator', None)
++        if height_int is not None:
++            actions = height_int.apply(actions, self.obs_buf[:, 0], self.progress_buf)
++            control_input = (actions[:, 0:3], actions[:, 3])
++        if cmd_latency is None:
++            new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = \
++            self.quad_dynamics.run_simulation(
+                                             position=torso_pos,
+                                             velocity=lin_vel,
+                                             orientation=torso_quat[:, [3,0,1,2]], # (w, x, y, z)
+                                             angular_velocity=ang_vel,
+                                             control_input=control_input
+                                         )
++        else:
++            new_position, new_linear_velocity, new_angular_velocity, new_quaternion, new_linear_acceleration, new_angular_acceleration = \
++            cmd_latency.simulate(self.quad_dynamics,
++                                 position=torso_pos,
++                                 velocity=lin_vel,
++                                 orientation=torso_quat[:, [3,0,1,2]], # (w, x, y, z)
++                                 angular_velocity=ang_vel,
++                                 command=actions,                      # this step's mixed command (= self.actions; plus f_I with the height integrator)
++                                 step_count=self.progress_buf)
+         self.time_report.end_timer("dynamic simulation")        # set new state back
+         if self.no_grad:
+             new_position = new_position.detach()
+@@ -610,6 +759,10 @@ class DroneVLALongTaskEnv(DFlexEnv):
+ 
+         if len(env_ids) > 0:
+            self.reset(env_ids)
++           # Added in this project (2026-10-29, v4): with ORBIT_START_MODE deploy*, the VAE history returned for a reset drone starts over, as on the drone
++           # (obs_hist was taken before this step's physics and still holds the previous episode). Only DroneVLAOrbitEnv sets this flag.
++           if getattr(self, 'reset_hist_on_reset', False):
++               obs_hist[env_ids] = self.obs_hist_buf.get_concatenated()[env_ids]
+ 
+         # Senity check
+         if (torch.isnan(obs_hist).any() | torch.isinf(obs_hist).any()):
+@@ -631,9 +784,9 @@ class DroneVLALongTaskEnv(DFlexEnv):
+         if env_ids is not None:
+             num_reset_envs = len(env_ids)
+             if not self.visualize and self.domain_randomization:
+-                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # Uniform noise between 1.0 to 1.2
++                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # 2.95 ~ 3.35 kg
+                 self.mass[env_ids] = mass_with_noise
+-                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # Uniform noise between 24 and 26
++                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # 111.0 ~ 142.5 N (parameter; the real thrust is half)
+                 self.max_thrust[env_ids] = max_thrust_with_noise
+                 inertia = torch.tensor(self.init_inertia, device=self.device)  # Base inertia
+                 inertial_noise = (torch.rand(num_reset_envs, 3, device=self.device) - 0.5) * 2 * 0.2 * inertia  # ±20% noise
+diff --git a/envs/drone_vla_multi_map.py b/envs/drone_vla_multi_map.py
+index 0f0e5b6..21f6094 100644
+--- a/envs/drone_vla_multi_map.py
++++ b/envs/drone_vla_multi_map.py
+@@ -12,7 +12,8 @@ import torch
+ torch.autograd.set_detect_anomaly(True)
+ 
+ from torchvision.transforms import Resize
+-from torchvision.io import write_video
++# torchvision 0.26 removed video I/O; use this project's replacement.
++from utils.video_io import write_video
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import os
+@@ -84,24 +85,57 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         self.map_lib = {
+             "gate_left":"sv_917_3_left_nerfstudio",
+             "gate_mid":"sv_1007_gate_mid",
++            # Scenes added by this project. Values are .ply file names under envs/assets/point_cloud/ (no extension).
++            # The scene frame is the point-cloud frame, so gs_origin_offset and
++            # point_could_origin_offset are both [0,0,0].
++            "scene04": "scene04",
+         }
+         self.map_name = map_name
+         self.multi_map = ["gate_left", "gate_mid"]
+         self.multi_map_num = len(self.multi_map)
+ 
+         # SysID value
+-        self.min_mass = 1.0
+-        self.mass_range = 0.2
+-        self.min_thrust = 24.0
+-        self.thrust_range = 4.0
++        # ================= This project's airframe (adapted from the original drone 'carl') =================
++        # Sources: measurements and spec sheets of the real drone, summarised below.
++        # Platform: EA4014 KV370 x4 (replaced the EA4008 after a crash on 8/27; ESCs recalibrated) + 1355 props (13x5.5)
++        #   + 6S 6300 mAh
++        #   + Pixhawk 6X + Jetson Orin Nano + Gemini 2, 600 mm wheelbase. The original carl values are kept in comments.
++        #
++        # Mass (2026-09-21): not weighed; sum of the part specs 3.04~3.26 kg, nominal 3.15 kg.
++        #   Main items: battery ~930 g, motors 165 g x4, frame 675~690 g, Jetson 176 g, ESCs 44 g x4.
++        # Thrust (2026-09-21): set by the thrust-to-weight ratio, since the simulated translation only depends on thrust/mass.
++        #   thrust-to-weight = (1/hover throttle)^p, no mass needed:
++        #   - hover throttle: hover thrust estimate 0.639~0.682 in the flight logs of 9/14 (ULog #100~104)
++        #     (battery 23.4~22.4 V), after the motor change; PX4 THR_MDL_FAC=0, MC_BAT_SCALE_EN=0
++        #   - p: motor model fitted to the EA4014 KV370 manufacturer's 6S thrust tables (four tables, 15~18 inch props),
++        #     scaled to 13 inch: p(65%->100%) = 1.64~1.74 (checked 16->15 inch on the same prop line: thrust error -1~+2%)
++        #   -> thrust-to-weight 1.87~2.18 (with battery voltage), nominal 2.05; total thrust 2.05 x 3.15 kg = 6.46 kgf = 63.4 N.
++        #   Cross-check: UC-series prop coefficients predict a 3.15 kg hover throttle of 0.62~0.63, measured 0.64~0.68,
++        #   about 7% thrust apart (arm blockage, hot-air density): consistent; the UP series predicts 0.50~0.55: inconsistent.
++        #   The absolute thrust of 13 inch props varies +-15% with the prop type, so it is not used.
++        #   NOTE: the max_thrust parameter = 2 x the real total thrust, because the env limits the thrust command to [0,0.5]
++        #     (see the thrust_col line below). The usable total thrust is half this value.
++        # Inertia / Kp / Kd: per-component estimate from the EA4008 build; the heavier motors should add 35~50% inertia, but
++        #   the closed-loop body-rate time constant is tau = (I + Kd) / Kp and Kp was derived from tau = 0.025 s,
++        #   so scaling inertia and Kp together changes nothing; left as is. tau = 25 ms itself is an assumption
++        #   (the existing flight logs do not excite it enough to measure it). The original uses tau = 0.011 s on all axes.
++        # Delay: 13 inch props have more rotational inertia; motor response about 52 ms (original about 42 ms), assumed.
++        # Check: python tools/verify_dynamics.py --mass 3.15 --max-thrust 126.75 \
++        #         --inertia 0.038 0.040 0.070 --tau-rate 0.025 \
++        #         --br-delay 0.70 --thrust-delay 0.62 --cross-area 0.25
++        # ============================================================
++        self.min_mass = 2.95          # carl: 1.0   (3.15 kg +-0.2, 2.95 ~ 3.35 kg; old EA4008 estimate 2.25)
++        self.mass_range = 0.40        # carl: 0.2
++        self.min_thrust = 111.0       # carl: 24.0  (parameter 111.0 ~ 142.5 N = real 55.5 ~ 71.3 N)
++        self.thrust_range = 31.5      # carl: 4.0   (nominal 126.75 -> real 63.4 N, thrust-to-weight 2.05; old 103.4 / 36.5)
+         self.obs_noise_level = 0.1
+-        self.br_delay_factor = 0.8
+-        self.thrust_delay_factor = 0.7
++        self.br_delay_factor = 0.70   # carl: 0.8   (tau 31ms -> 42ms)
++        self.thrust_delay_factor = 0.62  # carl: 0.7  (tau 42ms -> 52ms)
+         self.start_height = 1.25
+         self.target_height = 1.3
+-        self.init_inertia = [0.01, 0.012, 0.025]
+-        self.init_kp = [1.0, 1.2, 2.5]
+-        self.init_kd = [0.001, 0.001, 0.002]
++        self.init_inertia = [0.038, 0.040, 0.070]   # carl: [0.01, 0.012, 0.025]
++        self.init_kp = [1.642, 1.728, 3.024]        # carl: [1.0, 1.2, 2.5]
++        self.init_kd = [0.00304, 0.00320, 0.00560]  # carl: [0.001, 0.001, 0.002]
+ 
+         # GS model
+         gs_dir = Path("assets/gs_data")
+@@ -135,7 +169,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         ply_file = point_cloud_dir / f"{self.map_lib[self.map_name]}.ply"
+         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+@@ -169,8 +203,17 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         self.collision_penalty_coef = 0.0
+         self.collision_penalty = self.collision_penalty_coef*self.survive_reward 
+ 
+-        self.obst_threshold = 0.5
+-        self.obst_collision_limit = 0.20
++        # ---- Safety envelope (this airframe) ----------------------------------
++        # The simulator treats the drone as a point with no collision volume. All obstacle distances are
++        # from the body centre to the nearest cloud point, so these thresholds must include the airframe radius.
++        #   safety radius = wheelbase/2 (0.30 m) + 13 inch prop radius (0.165 m) = 0.465 m
++        #   tip-to-tip width = 0.93 m
++        # The original carl has a radius of about 0.25 m and a 0.5 m threshold (about 2x); same ratio here.
++        # scene04 measured: median clearance at flight height 0.78 m, maximum 1.51 m: the airframe fits;
++        # with safety_distance=0.65 the largest connected free area for A* is still 32 x 16.4 m.
++        self.obst_threshold = 0.95        # carl: 0.5  (0.465 radius + 0.485 reaction margin)
++        self.obst_collision_limit = 0.50  # carl: 0.20 (slightly above the 0.465 physical radius)
++        # ---------------------------------------------------------
+         self.body_rate_threshold = 15
+         self.domain_randomization = False
+ 
+@@ -280,7 +323,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+     def configure_tasks(self, map_name):
+         # generate ref_traj
+         if map_name == 'gate_mid':
+-            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
++            self.traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
+             self.wp_num = 3
+             self.ref_traj_size = 20
+ 
+@@ -312,7 +355,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+             }
+ 
+         elif map_name == 'gate_left':
+-            traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
++            self.traj_start = torch.tensor([[-6.0, 0.0, 1.4]], device=self.device)
+             self.wp_num = 3
+             self.ref_traj_size = 20
+             self.task_table = {
+@@ -351,7 +394,7 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         ply_file = point_cloud_dir / f"{self.map_lib[self.map_name]}.ply"
+         self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
+         self.traj_planner = TrajectoryPlanner(ply_file=ply_file, 
+-                                            safety_distance=0.15, 
++                                            safety_distance=0.55,  # carl: 0.15; must be >= the airframe radius 0.465
+                                             batch_size=1, 
+                                             wp_distance=2.0,
+                                             verbose=False)
+@@ -359,8 +402,11 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         for key, value in self.task_table.items():
+             reward_wp = value[0]
+             traj_wp = reward_wp + self.point_could_origin_offset[0].repeat((reward_wp.shape[0],1))
+-            traj_start = torch.tensor([[-6.0, 0, 1.4]], device=self.device)
+-            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(traj_start, 
++            # NOTE: upstream bug fix (changed in this project): this used to hard-code traj_start,
++            #   overwriting the start set in each scene branch. Both scenes in this file happen to start at -6,0,1.4,
++            #   so behaviour is unchanged, but a new scene would hit it, without any error.
++            #   (drone_vla_long_task.py had the same problem; fixed too.)
++            self.task_table[key].append(torch.tensor(self.traj_planner.plan_trajectories(self.traj_start, 
+                                                                                             [traj_wp], 
+                                                                                             des_wp_num=self.ref_traj_size)[0], 
+                                                     device=self.device))
+@@ -447,12 +493,13 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+         self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
+ 
+         # Initialize the drone dynamics parameters
+-        self.mass = torch.full((self.num_envs,), self.min_mass+0.5*self.mass_range, device=self.device)  # All drones have mass = 1.2 kg
+-        self.max_thrust = torch.full((self.num_envs,), self.min_thrust+0.5*self.thrust_range, device=self.device)  # All drones have max_thrust = 23 N
++        self.mass = torch.full((self.num_envs,), self.min_mass+0.5*self.mass_range, device=self.device)  # nominal 3.15 kg
++        self.max_thrust = torch.full((self.num_envs,), self.min_thrust+0.5*self.thrust_range, device=self.device)  # nominal 126.75 N parameter = 63.4 N real total thrust
+         self.hover_thrust = self.mass * 9.81  # Hover thrust for each drone
+         inertia = torch.tensor(self.init_inertia, device=self.device)  # Diagonal inertia components
+         self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)  # Repeat for all drones
+-        link_length = 0.15  # meters
++        link_length = 0.30  # meters (half the measured 600 mm wheelbase)
++        # Note: QuadrotorSimulator only stores it as self.l and never uses it; changing it has no effect.
+         Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+         Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)  # Repeat for all drones
+ 
+@@ -638,9 +685,9 @@ class DroneVLAMultiMapEnv(DFlexEnv):
+             num_reset_envs = len(env_ids)
+             if not self.visualize and self.domain_randomization:
+                 # Randomize mass, max_thrust, and inertia for the specified environments
+-                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # Uniform noise between 1.0 to 1.2
++                mass_with_noise = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass  # 2.95 ~ 3.35 kg
+                 self.mass[env_ids] = mass_with_noise
+-                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # Uniform noise between 24 and 26
++                max_thrust_with_noise = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust  # 111.0 ~ 142.5 N (parameter; the real thrust is half)
+                 self.max_thrust[env_ids] = max_thrust_with_noise
+                 inertia = torch.tensor(self.init_inertia, device=self.device)  # Base inertia
+                 inertial_noise = (torch.rand(num_reset_envs, 3, device=self.device) - 0.5) * 2 * 0.2 * inertia  # ±20% noise
+diff --git a/envs/drone_vla_orbit.py b/envs/drone_vla_orbit.py
+new file mode 100644
+index 0000000..6f36bee
+--- /dev/null
++++ b/envs/drone_vla_orbit.py
+@@ -0,0 +1,745 @@
++# Added in this project (2026-09-21): orbit-the-box inspection task, scene sunny_baseball_field.
++#
++# Task: keep the nose (camera) pointed at the box and fly a horizontal circle of radius R at height H with speed V.
++#   The language instruction sets the direction: [Task 0] clockwise, [Task 1] counter-clockwise (seen from above).
++#   "Stop after one lap" is not part of the policy: the policy only learns to keep orbiting. On the drone the onboard
++#   program accumulates the nose yaw (the nose always points at the box, so 360 deg = one lap), decides when the lap
++#   is done and switches to position hold.
++#   Reason: the policy sees neither x/y position nor time, and the start and the end of a lap look exactly the same,
++#   so it could not both depart and stop.
++#
++# Inherits DroneVLALongTaskEnv and overrides only __init__, init_sim, set_task_eval, reset,
++# calculateObservations and calculateReward; step / image features / VLM / saving come from the parent class.
++#
++# Differences from the parent class (upstream GRaD-Nav++ long task) and why:
++#   1. The camera is rendered with the attitude (x,-y,-z,w). Upstream negates y and z of the position before the
++#      renderer but not the quaternion, so the camera looks in the mirror image of the body heading (body yaw psi,
++#      camera looks at -psi). Verified numerically on 2026-09-21: the dynamics and the obstacle cone use the correct
++#      (cos psi, sin psi); only rendering and quaternion_yaw_forward use (cos psi, -sin psi).
++#      The original tasks keep yaw near 0, so it never showed; an orbit turns 360 deg, and without the fix the nose
++#      points at the box while the camera does not see it.
++#   2. The reward's nose direction uses the correct rotation formula (not utils.rotation.quaternion_yaw_forward,
++#      same reason).
++#   3. The thrust penalty is relative to this airframe's hover command (upstream hard-codes 0.42 = the hover value of
++#      the original drone carl; this airframe is about 0.24), and each environment only counts its own (upstream adds
++#      a torch.sum over the whole batch to every environment).
++#   4. prev_lin_vel is updated every step (upstream never updates it, it stays 0, so the "acceleration penalty" is
++#      really a velocity penalty that fights the orbit speed).
++#   5. No A* reference trajectory or waypoints (upstream picks "the next point 0.5 m further in x", assuming travel
++#      along +x, which fails on a circle); instead an orbit velocity field: tangential speed V plus corrections that
++#      pull back to radius R and height H.
++#   6. The attitude penalty covers tilt only (roll/pitch), not yaw (upstream penalises the difference to the start
++#      quaternion, and an orbit necessarily turns 360 deg).
++#   7. Each episode starts at a random angle on the circle, nose at the box.
++#   8. Episodes end early closer than 1.0 m or farther than 5.0 m from the box centre (upstream has no collision
++#      termination; this only stops clearly lost episodes from wasting samples, obstacle avoidance itself is still
++#      GRaD-Nav++'s distance reward).
++#   9. The "body rate too high" termination reads privilege_obs_buf[:, 13:16] (body rates). Upstream reads 10:13, the
++#      quaternion: its norm is always 1, below the threshold 15, so the condition never fired.
++#
++# v2 (2026-09-26): the policy from the first training run (v1) never completed a lap (0.24 m/s, only about 170 deg in
++# 35 s, 15 cm low). Three fixes, each behind an env_hyper switch; absent = v1 behaviour (old checkpoints, evaluations
++# and deployment reference files stay reproducible). The v2 training config enables all three:
++#   ORBIT_PROGRESS_REWARD (v1 = 0): orbit progress reward = weight x clip(tangential speed in the commanded
++#      direction / V, -1, 1). In v1 only track (squared velocity error) encouraged orbiting: hovering still on the
++#      circle lost only 0.5 per step, and the push weakened near the target speed. Summed over an episode the
++#      progress term equals the arc flown, i.e. the "one lap" reward paid out per step (a one-off "lap done" reward has
++#      zero gradient in differentiable RL, and the critic cannot see how far it has gone: start and one-lap positions
++#      are the same).
++#   ORBIT_OBST_MIN_Z (v1 = no filter): drop obstacle points below this z (ground, grass, 3DGS noise under the ground).
++#      v1's obstacle term pays +d when d < 0.95 m and counted the ground too: flying 15 cm low earned about +0.84 per
++#      step for free, more than orbiting did.
++#   ORBIT_OBS_FRAME (v1 = 'world'): with 'heading' the policy's attitude is the quaternion with yaw removed (w >= 0)
++#      and its velocity is in the heading frame (forward, left, up). v1 used the world quaternion: one lap flips its
++#      sign (q -> -q), all training starts have w <= 0, and after passing 0 deg (east of the box) the policy sees a
++#      form it never trained on and gets stuck there.
++#      The new form is independent of world yaw: an ideal orbit looks the same anywhere on the circle (only the image
++#      differs), and on the drone there is no need to align with PX4's yaw.
++#      The critic's attitude fields become the continuous, unique [nose direction hx, hy, body up-vector x, y] and its
++#      velocity moves to the heading frame (the VAE's velocity target reads the same field, so it stays consistent).
++#   Also (both versions, no effect on reward values): calculateReward reads position / velocity / attitude from the
++#   state tensors stored by calculateObservations (the v2 critic fields are no longer world-frame); per-term rewards
++#   are stored in self.last_reward_terms and accumulated for the training log (pop_reward_term_means).
++#
++# Real-drone latency (2026-10-19): v2's first real flight oscillated up and down. With LATENCY_MODEL (dict) enabled in
++#   env_hyper, the physics goes through envs/assets/command_latency.py ("command delay + motor response of the
++#   thrust"); absent or enabled not True = the original simulator (step() uses the original run_simulation, step for
++#   step identical). Observations, rewards and starts are unchanged. Details in the header of command_latency.py.
++#
++# v4 (2026-10-29): two switches; absent = v3 behaviour (step for step identical).
++#   HEIGHT_INTEGRATOR (dict, created only with enabled: True): adds a height integral f_I to the thrust
++#      (envs/assets/height_integrator.py), removing v3's constant height offset (about 1.1 cm lower for every 1% of
++#      extra mass). The onboard program must do the same.
++#   ORBIT_START_MODE ('upstream' = original behaviour): 'deploy' / 'deploy_warm' start each episode like reset() in
++#      orbit_policy/orbit_runtime.py on the drone: the start thrust command is the nominal hover f_hover_prog (upstream
++#      gives every reset drone the hover fraction of drone 0); the VAE history starts over ('deploy': all zero;
++#      'deploy_warm': 5 copies of the post-reset observation); the action low-pass filter of the training algorithm
++#      restarts too ('deploy': the first step uses the raw action; 'deploy_warm': starts from the hover action).
++#      Upstream never clears the low-pass filter or the VAE history between episodes, so a new episode starts with the
++#      previous episode's data, unlike the drone.
++
++import math
++import numpy as np
++import torch
++from pathlib import Path
++from torchvision.transforms import Resize
++
++from envs.dflex_env import DFlexEnv
++from envs.drone_vla_long_task import DroneVLALongTaskEnv
++from envs.assets.quadrotor_dynamics_advanced import QuadrotorSimulator
++from envs.assets.command_latency import CommandLatency
++from envs.assets.height_integrator import HeightIntegrator
++from utils import torch_utils as tu
++from utils.common import get_time_stamp
++from utils.gs_local import get_gs
++from utils.rotation import quaternion_to_euler
++from utils.model import ModelBuilder
++from utils.point_cloud_util import ObstacleDistanceCalculator
++from utils.hist_obs_buffer import ObsHistBuffer
++from utils.time_report import TimeReport
++from models.clip import VLM
++from models.squeeze_net import VisualPerceptionNet
++
++
++def proper_heading_xy(quat_xyzw):
++    """Horizontal component of the body x axis in the world frame (correct rotation formula, consistent with the dynamics and the obstacle cone), normalised."""
++    x, y, z, w = quat_xyzw[:, 0], quat_xyzw[:, 1], quat_xyzw[:, 2], quat_xyzw[:, 3]
++    fx = 1 - 2 * (y * y + z * z)
++    fy = 2 * (x * y + w * z)
++    h = torch.stack((fx, fy), dim=1)
++    return h / (torch.norm(h, dim=-1, keepdim=True) + 1e-8)
++
++
++def tilt_quat(quat_xyzw):
++    """Attitude quaternion (x,y,z,w) with yaw removed: q_tilt = q_yaw(psi)^-1 * q, psi = direction of the body x axis projected on the ground; w >= 0.
++    Independent of world yaw; w only approaches 0 near 180 deg of tilt, so it is continuous and unique in normal flight."""
++    x, y, z, w = quat_xyzw[:, 0], quat_xyzw[:, 1], quat_xyzw[:, 2], quat_xyzw[:, 3]
++    half = 0.5 * torch.atan2(2 * (x * y + w * z), 1 - 2 * (y * y + z * z))
++    zero = torch.zeros_like(half)
++    q_yaw_inv = torch.stack([zero, zero, -torch.sin(half), torch.cos(half)], dim=1)
++    qt = tu.quat_mul(q_yaw_inv, quat_xyzw)
++    return torch.where(qt[:, 3:4] < 0, -qt, qt)
++
++
++def to_heading_frame(vec_xyz, heading_xy):
++    """World-frame vector to the heading frame (forward, left, up): yaw only, no tilt. heading_xy is the normalised horizontal nose direction."""
++    hx, hy = heading_xy[:, 0], heading_xy[:, 1]
++    fwd = hx * vec_xyz[:, 0] + hy * vec_xyz[:, 1]
++    left = -hy * vec_xyz[:, 0] + hx * vec_xyz[:, 1]
++    return torch.stack([fwd, left, vec_xyz[:, 2]], dim=1)
++
++
++class DroneVLAOrbitEnv(DroneVLALongTaskEnv):
++    # Box centre (scene frame, metres): horizontal median of the box-coloured points in the sunny_baseball_field dense cloud
++    ORBIT_CENTER = (-0.077, 0.575)
++    ORBIT_RADIUS = 2.5      # chosen so the whole box (including its bottom) is inside the 55 deg vertical field of view
++    ORBIT_HEIGHT = 1.0
++    ORBIT_SPEED = 0.5       # m/s, one lap about 31 s; yaw rate 0.2 rad/s, 40% of the simulator limit 0.5
++
++    TASKS = {
++        # Direction: +1 = counter-clockwise (seen from above, angle increasing), -1 = clockwise.
++        # Wording: the CLIP text embeddings of CLOCKWISE/COUNTERCLOCKWISE have similarity 0.932, easier to tell apart than LEFT/RIGHT (0.951)
++        # (a pair the upstream paper trained successfully on has 0.904).
++        "[Task 0] Fly a CLOCKWISE circle around the box while facing it": -1.0,
++        "[Task 1] Fly a COUNTERCLOCKWISE circle around the box while facing it": 1.0,
++    }
++
++    def __init__(self,
++                 render=False,
++                 device='cuda:0',
++                 num_envs=4096,
++                 seed=0,
++                 episode_length=1000,
++                 no_grad=True,
++                 stochastic_init=False,
++                 MM_caching_frequency=1,
++                 early_termination=True,
++                 map_name='sunny_baseball_field',
++                 eval_task_id=0,
++                 env_hyper=None,
++                 ):
++        if map_name != 'sunny_baseball_field':
++            raise ValueError(f"DroneVLAOrbitEnv only supports sunny_baseball_field, got {map_name}")
++
++        self.agent_name = 'drone_vla_orbit'
++        self.num_history = env_hyper.get('HISTORY_BUFFER_NUM', 5)
++        self.num_latent = env_hyper.get('LATENT_VECT_NUM', 24)
++        self.vlm_feature_dim = env_hyper.get('VLM_FEATURE_SIZE', 256)
++        self.visual_feature_size = env_hyper.get('SINGLE_VISUAL_INPUT_SIZE', 64)
++        self.use_depth = env_hyper.get('DEPTH_DATA', False)
++        self.num_privilege_obs = 30 + self.visual_feature_size + self.num_latent
++        self.num_latent_obs = 17 + self.num_latent + self.visual_feature_size
++        num_obs = 17 + self.num_latent + self.visual_feature_size
++        num_act = 4
++
++        # Do not call the parent __init__ (it only knows scene04 / gate_mid_new and runs A*); initialise the base class directly
++        DFlexEnv.__init__(self, num_envs, num_obs, num_act, episode_length, MM_caching_frequency,
++                          seed, no_grad, render, device)
++        self.stochastic_init = stochastic_init
++        self.early_termination = early_termination
++        self.device = device
++        self.time_report = TimeReport()
++        for name in ("dynamic simulation", "3D GS inference", "point cloud collision check", "VLM inference"):
++            self.time_report.add_timer(name)
++        self.map_name = map_name
++
++        # ---- Airframe parameters: same as envs/drone_vla_long_task.py (sources and derivation in the comment there;
++        #      change all five environment files together)
++        self.min_mass = 2.95
++        self.mass_range = 0.40
++        self.min_thrust = 111.0
++        self.thrust_range = 31.5
++        self.obs_noise_level = 0.1
++        self.br_delay_factor = 0.70
++        self.thrust_delay_factor = 0.62
++        self.init_inertia = [0.038, 0.040, 0.070]
++        self.init_kp = [1.642, 1.728, 3.024]
++        self.init_kd = [0.00304, 0.00320, 0.00560]
++
++        # ---- Orbit geometry
++        self.orbit_center = torch.tensor(self.ORBIT_CENTER, device=self.device)
++        self.orbit_radius = self.ORBIT_RADIUS
++        self.orbit_height = self.ORBIT_HEIGHT
++        self.orbit_speed = self.ORBIT_SPEED
++        self.start_height = self.orbit_height
++        self.target_height = self.orbit_height
++
++        # ---- v2 switches (see the header; absent = v1 behaviour)
++        self.progress_strength = float(env_hyper.get('ORBIT_PROGRESS_REWARD', 0.0))
++        self.obst_min_z = env_hyper.get('ORBIT_OBST_MIN_Z', None)
++        self.obs_frame = env_hyper.get('ORBIT_OBS_FRAME', 'world')
++        if self.obs_frame not in ('world', 'heading'):
++            raise ValueError(f"ORBIT_OBS_FRAME must be 'world' or 'heading', got {self.obs_frame}")
++
++        # ---- 3DGS and obstacle point cloud (scene frame = training frame, all offsets 0)
++        gs_dir = Path("assets/gs_data")
++        resolution_quality = 0.4
++        self.gs = get_gs(self.map_name, gs_dir, resolution_quality)
++
++        self.init_sim()
++        self.episode_length = episode_length
++        # ---- Real-drone latency (2026-10-19, see the header): absent or enabled not True -> cmd_latency = None, step() uses the original physics
++        self.latency_cfg = env_hyper.get('LATENCY_MODEL', None)
++        self.cmd_latency = None
++        if self.latency_cfg is not None and self.latency_cfg.get('enabled', False) is True:
++            self.cmd_latency = CommandLatency(self.latency_cfg, self.num_envs, self.device, self.dt, self.start_joint_q,
++                                              quad=self.quad_dynamics)
++        # ---- v4 (2026-10-29, see the header): absent = v3 behaviour
++        self.height_int_cfg = env_hyper.get('HEIGHT_INTEGRATOR', None)
++        self.height_integrator = None
++        if self.height_int_cfg is not None and self.height_int_cfg.get('enabled', False) is True:
++            self.height_integrator = HeightIntegrator(self.height_int_cfg, self.num_envs, self.device, self.dt, self.orbit_height)
++        self.start_mode = env_hyper.get('ORBIT_START_MODE', 'upstream')
++        if self.start_mode not in ('upstream', 'deploy', 'deploy_warm'):
++            raise ValueError(f"ORBIT_START_MODE must be 'upstream', 'deploy' or 'deploy_warm', got {self.start_mode}")
++        self.reset_hist_on_reset = self.start_mode != 'upstream'        # read by step() in drone_vla_long_task.py
++        f_start = float((self.latency_cfg or {}).get('f_hover_prog', 0.2438))    # start thrust of reset() on the drone = meta hover_thrust_frac
++        self.start_cmd_deploy = torch.tensor([0., 0., 0., f_start], device=self.device)
++        self.gs_origin_offset = torch.zeros((self.num_envs, 3), device=self.device)
++        self.point_could_origin_offset = torch.zeros((self.num_envs, 3), device=self.device)
++        # Made by tools/prepare_pointcloud.py: within 12 m of the box, radius outlier removal clears floaters along the orbit
++        ply_file = Path(__file__).parent / "assets" / "point_cloud" / "sunny_baseball_field.ply"
++        self.point_cloud = ObstacleDistanceCalculator(ply_file=ply_file)
++        self.obst_points_total = int(self.point_cloud.points.shape[0])
++        if self.obst_min_z is not None:
++            # 99% of the grass points are below 0.15 m; the box spans 0-1.77 m and its part above 0.30 m is kept (measured 2026-09-26)
++            pts = self.point_cloud.points
++            self.point_cloud.points = pts[pts[:, 2] >= float(self.obst_min_z)].contiguous()
++        self.obst_points_used = int(self.point_cloud.points.shape[0])
++
++        # ---- Tasks (language instruction -> orbit direction)
++        self.task_table = dict(self.TASKS)
++        task_names = list(self.task_table.keys())
++        self.task_num = len(task_names)
++        self.eval_task_id = eval_task_id
++        if self.num_envs == 1:
++            self.ini_task_indices = torch.tensor([self.eval_task_id], device=self.device)
++        else:
++            self.ini_task_indices = torch.randint(0, self.task_num, (self.num_envs,))
++        self.task_list = [task_names[i] for i in self.ini_task_indices]
++        self.orbit_dir = torch.tensor([self.task_table[n] for n in self.task_list], device=self.device)
++
++        # ---- Reward weights (negative = penalty). Magnitudes follow upstream gate_mid_new; orbit-specific terms are new
++        self.survive_reward = 8.0
++        self.look_strength = -3.0           # x (1 - cos of the angle between the nose and the direction to the box)
++        self.track_strength = -2.0          # x |v - v_des|^2, v_des = orbit velocity field
++        self.radius_penalty = -2.0          # x (r - R)^2
++        self.height_penalty = -1.5          # x (z - H)^2
++        self.height_change_penalty = -0.5   # x vz^2
++        self.tilt_penalty = -0.5            # x (1 - cos of the tilt angle), roll/pitch only
++        self.action_penalty = -1.0
++        self.action_change_penalty = -1.0
++        self.smooth_penalty = -0.75
++        self.lin_vel_rate_penalty = -0.75   # x |dv|^2 (prev_lin_vel updated every step)
++        self.jitter_penalty = -0.1
++        self.obstacle_strength = 1.0        # upstream's obstacle-distance reward, unchanged
++        self.collision_penalty_coef = 0.0
++        self.collision_penalty = self.collision_penalty_coef * self.survive_reward
++        # Correction gains and limit of the velocity field
++        self.radial_gain = 1.0              # 1/s, radius error -> radial velocity
++        self.vertical_gain = 1.0            # 1/s, height error -> vertical velocity
++        self.correction_limit = 0.5         # m/s
++
++        # ---- Safety envelope (same as the parent class, includes the 0.465 m airframe radius)
++        self.obst_threshold = 0.95
++        self.obst_collision_limit = 0.50
++        self.body_rate_threshold = 15
++        self.domain_randomization = False
++        # Early termination
++        self.min_radius = 1.0               # box half-diagonal 0.36 m + airframe radius 0.465 m = 0.83 m means contact
++        self.max_radius = 5.0
++        self.min_height = 0.3
++        self.max_height = 3.0
++
++        self.nerf_count = 0
++        self.nerf_freq = 1
++        self.depth_list = 0
++        self.condition_approach = 4
++        self.training_stage = 0
++        self.traj_planning_count = 0
++
++        # ---- Visual network, VLM, observation history (same as the parent class)
++        self.visual_net = VisualPerceptionNet(input_channels=1 if self.use_depth else 3,
++                             visual_feature_size=self.visual_feature_size).to(self.device)
++        self.vlm = VLM(self.num_envs, self.device, vlm_feature_size=self.vlm_feature_dim).to(self.device)
++        self.obs_hist_buf = ObsHistBuffer(batch_size=self.num_envs, vector_dim=self.num_latent_obs,
++                                          buffer_size=self.num_history, device=self.device)
++
++        self.hyper_parameter = {
++            "task": "orbit", "orbit_center": list(self.ORBIT_CENTER), "orbit_radius": self.orbit_radius,
++            "orbit_height": self.orbit_height, "orbit_speed": self.orbit_speed,
++            "survive_reward": self.survive_reward, "look_strength": self.look_strength,
++            "track_strength": self.track_strength, "radius_penalty": self.radius_penalty,
++            "height_penalty": self.height_penalty, "height_change_penalty": self.height_change_penalty,
++            "tilt_penalty": self.tilt_penalty, "action_penalty": self.action_penalty,
++            "action_change_penalty": self.action_change_penalty, "smooth_penalty": self.smooth_penalty,
++            "lin_vel_rate_penalty": self.lin_vel_rate_penalty, "jitter_penalty": self.jitter_penalty,
++            "obstacle_strength": self.obstacle_strength, "obst_threshold": self.obst_threshold,
++            "obst_collision_limit": self.obst_collision_limit, "collision_penalty_coef": self.collision_penalty_coef,
++            "radial_gain": self.radial_gain, "vertical_gain": self.vertical_gain,
++            "min_mass": self.min_mass, "mass_range": self.mass_range, "min_thrust": self.min_thrust,
++            "thrust_range": self.thrust_range, "br_delay_factor": self.br_delay_factor,
++            "thrust_delay_factor": self.thrust_delay_factor, "resolution_quality": resolution_quality,
++            "sim_dt": self.dt,
++            "progress_strength": self.progress_strength, "obst_min_z": self.obst_min_z,
++            "obst_points_used": self.obst_points_used, "obst_points_total": self.obst_points_total,
++            "obs_frame": self.obs_frame,
++        }
++        if self.latency_cfg is not None:
++            self.hyper_parameter["latency_model"] = dict(self.cmd_latency.cfg) if self.cmd_latency is not None \
++                else dict(self.latency_cfg)
++        if self.height_int_cfg is not None:
++            self.hyper_parameter["height_integrator"] = dict(self.height_integrator.cfg) if self.height_integrator is not None \
++                else dict(self.height_int_cfg)
++        if self.start_mode != 'upstream':
++            self.hyper_parameter["start_mode"] = self.start_mode
++        self.last_reward_terms = {}
++        self._term_acc = {}
++        self._term_count = 0
++
++        # ---- Visualisation records (same fields as the parent class, used by save_recordings_batch)
++        self.time_stamp = get_time_stamp()
++        self.episode_count = 0
++        for k in ("x", "y", "z", "roll", "pitch", "yaw", "velo_x", "velo_y", "velo_z", "ang_velo_x", "ang_velo_y",
++                  "ang_velo_z", "vae_velo_x", "vae_velo_y", "vae_velo_z", "depth", "img"):
++            setattr(self, f"{k}_record", [[] for _ in range(self.task_num)])
++        self.action_record = np.zeros([self.task_num, self.episode_length, 4])
++        self.done_record = np.zeros([self.task_num])
++        self.reward_record = torch.zeros([self.task_num], device=self.device)
++
++    # ------------------------------------------------------------------
++    def _sample_start(self, env_ids, fixed=False):
++        """Start on the circle: angle 0 when fixed (evaluation, reproducible), otherwise uniform random. Nose at the box."""
++        n = len(env_ids)
++        th = torch.zeros(n, device=self.device) if fixed else torch.rand(n, device=self.device) * 2 * math.pi
++        pos = torch.stack([self.orbit_center[0] + self.orbit_radius * torch.cos(th),
++                           self.orbit_center[1] + self.orbit_radius * torch.sin(th),
++                           torch.full_like(th, self.orbit_height)], dim=1)
++        psi = th + math.pi
++        quat = torch.stack([torch.zeros_like(psi), torch.zeros_like(psi), torch.sin(psi / 2), torch.cos(psi / 2)], dim=1)
++        self.start_pos[env_ids] = pos
++        self.start_quat[env_ids] = quat
++
++    def init_sim(self):
++        self.builder = ModelBuilder()
++        self.dt = 0.05
++        self.sim_dt = self.dt
++        self.ground = True
++        self.num_joint_q = 11
++        self.num_joint_qd = 10
++
++        self.x_unit_tensor = tu.to_torch([1, 0, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
++        self.y_unit_tensor = tu.to_torch([0, 1, 0], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
++        self.z_unit_tensor = tu.to_torch([0, 0, 1], dtype=torch.float, device=self.device, requires_grad=False).repeat((self.num_envs, 1))
++        # Parent-class fields; this environment's start attitude per episode comes from _sample_start
++        self.start_rot = np.array([0., 0., 0., 1.])
++        self.start_rotation = tu.to_torch(self.start_rot, device=self.device, requires_grad=False)
++        self.up_vec = self.z_unit_tensor.clone()
++        self.heading_vec = self.x_unit_tensor.clone()
++        self.inv_start_rot = tu.quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
++
++        self.mass = torch.full((self.num_envs,), self.min_mass + 0.5 * self.mass_range, device=self.device)
++        self.max_thrust = torch.full((self.num_envs,), self.min_thrust + 0.5 * self.thrust_range, device=self.device)
++        self.hover_thrust = self.mass * 9.81
++        inertia = torch.tensor(self.init_inertia, device=self.device)
++        self.inertia = torch.diag(inertia).unsqueeze(0).repeat(self.num_envs, 1, 1)
++        Kp = torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
++        Kd = torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
++        self.quad_dynamics = QuadrotorSimulator(mass=self.mass, inertia=self.inertia, link_length=0.30, Kp=Kp, Kd=Kd,
++                                                freq=200.0, max_thrust=self.max_thrust, total_time=self.sim_dt,
++                                                rotor_noise_std=0.01, br_noise_std=0.01)
++
++        self.start_body_rate = [0., 0., 0.]
++        self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
++        self.control_base = self.start_norm_thrust[0]
++        self.start_action = self.start_body_rate + self.start_norm_thrust
++
++        self.start_pos = torch.zeros((self.num_envs, 3), device=self.device)
++        self.start_quat = torch.zeros((self.num_envs, 4), device=self.device)
++        self._sample_start(torch.arange(self.num_envs, device=self.device), fixed=True)
++        self.start_pos_backup = self.start_pos.clone()
++        self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
++        self.start_joint_target = tu.to_torch(self.start_action, device=self.device)
++        self.prev_thrust = torch.ones([self.num_envs, 1], device=self.device) * (self.hover_thrust / self.max_thrust).unsqueeze(-1)
++
++        self.actions = self.start_joint_q.repeat(self.num_envs, 1).clone()
++        self.prev_actions = self.actions.clone()
++        self.prev_prev_actions = self.actions.clone()
++        self.state_joint_q = torch.zeros([self.num_envs, 7], device=self.device)
++        self.state_joint_qd = torch.zeros([self.num_envs, 6], device=self.device)
++        self.state_joint_qdd = torch.zeros([self.num_envs, 6], device=self.device)
++        self.latent_vect = torch.zeros([self.num_envs, self.num_latent], device=self.device, dtype=torch.float)
++        self.lin_vel_vae = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
++        self.prev_lin_vel = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
++        self.vlm_feature = torch.zeros([self.num_envs, self.vlm_feature_dim], device=self.device, dtype=torch.float)
++
++    def set_task_eval(self, task_id):
++        if self.num_envs == 1:
++            name = list(self.task_table.keys())[task_id]
++            self.ini_task_indices = torch.tensor([task_id], device=self.device)
++            self.task_list = [name] * self.num_envs
++            self.orbit_dir = torch.full_like(self.orbit_dir, self.task_table[name])
++
++    # ------------------------------------------------------------------
++    def reset(self, env_ids=None, force_reset=True):
++        if env_ids is None and force_reset:
++            env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
++        if env_ids is None:
++            return self.obs_buf, self.vlm_feature
++
++        num_reset_envs = len(env_ids)
++        if not self.visualize and self.domain_randomization:
++            self.mass[env_ids] = torch.rand(num_reset_envs, device=self.device) * self.mass_range + self.min_mass
++            self.max_thrust[env_ids] = torch.rand(num_reset_envs, device=self.device) * self.thrust_range + self.min_thrust
++            inertia = torch.tensor(self.init_inertia, device=self.device)
++            noise = (torch.rand(num_reset_envs, 3, device=self.device) - 0.5) * 2 * 0.2 * inertia
++            self.inertia[env_ids] = torch.diag_embed(inertia + noise)
++            self.hover_thrust[env_ids] = self.mass[env_ids] * 9.81
++            self.quad_dynamics = QuadrotorSimulator(
++                mass=self.mass, inertia=self.inertia, link_length=0.30,
++                Kp=torch.tensor(self.init_kp, device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
++                Kd=torch.tensor(self.init_kd, device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
++                freq=200.0, max_thrust=self.max_thrust, total_time=self.sim_dt, rotor_noise_std=0.01, br_noise_std=0.01)
++            self.start_norm_thrust = [(self.hover_thrust / self.max_thrust).clone().detach().cpu().numpy()[0]]
++            self.control_base = self.start_norm_thrust[0]
++            self.start_action = self.start_body_rate + self.start_norm_thrust
++            self.start_joint_q = tu.to_torch(self.start_action, device=self.device)
++
++        self.state_joint_q = self.state_joint_q.clone()
++        self.state_joint_qd = self.state_joint_qd.clone()
++        self.state_joint_qdd = self.state_joint_qdd.clone()
++
++        # Start: random angle on the circle (angle 0 in evaluation), nose at the box
++        self._sample_start(env_ids, fixed=self.visualize)
++        self.state_joint_q[env_ids, 0:3] = self.start_pos[env_ids].clone()
++        self.state_joint_q[env_ids, 3:7] = self.start_quat[env_ids].clone()
++        self.state_joint_qd[env_ids, :] = 0.
++        self.state_joint_qdd[env_ids, :] = 0.
++        # v4 ORBIT_START_MODE deploy*: start thrust command = nominal hover (= reset() on the drone); upstream = hover fraction of drone 0 (original behaviour)
++        start_cmd = self.start_joint_q if self.start_mode == 'upstream' else self.start_cmd_deploy
++        self.actions[env_ids, :] = start_cmd.clone()
++        self.prev_actions[env_ids, :] = start_cmd.clone()
++        self.prev_prev_actions[env_ids, :] = start_cmd.clone()
++
++        if not self.visualize and self.stochastic_init:
++            n = len(env_ids)
++            self.state_joint_q[env_ids, 0:3] += 0.3 * (torch.rand(size=(n, 3), device=self.device) - 0.5) * 2.
++            angle = (torch.rand(n, device=self.device) - 0.5) * np.pi / 12.
++            axis = torch.nn.functional.normalize(torch.rand((n, 3), device=self.device) - 0.5)
++            self.state_joint_q[env_ids, 3:7] = tu.quat_mul(self.state_joint_q[env_ids, 3:7], tu.quat_from_angle_axis(angle, axis))
++            self.state_joint_qd[env_ids, :] = 0.5 * (torch.rand(size=(n, 6), device=self.device) - 0.5)
++            self.state_joint_qdd[env_ids, :] = 0.05 * (torch.rand(size=(n, 6), device=self.device) - 0.5)
++            self.actions[env_ids, :] = start_cmd.clone() + 0.05 * torch.rand(size=(n, 4), device=self.device)
++            self.prev_actions[env_ids, :] = start_cmd.clone()
++            self.prev_prev_actions[env_ids, :] = start_cmd.clone()
++
++        if self.cmd_latency is not None:
++            # Real-drone latency: redraw latency and motor parameters for these drones, set the command history to the reset command and the throttle to hover
++            # (thrust_ref: max_thrust needs quad for each drone's hover throttle; it was rebuilt above with the redrawn mass and max_thrust)
++            self.cmd_latency.reset(env_ids, self.actions, self.prev_actions, quad=self.quad_dynamics)
++        if self.height_integrator is not None:
++            self.height_integrator.reset(env_ids)            # v4: f_I = 0 at episode start (= at hand-over on the drone)
++
++        self.latent_vect[env_ids] = 0.
++        self.lin_vel_vae[env_ids] = 0.
++        # Start the acceleration penalty from the post-reset velocity, avoiding a fake large acceleration on the reset step
++        self.prev_lin_vel = self.prev_lin_vel.clone()
++        self.prev_lin_vel[env_ids] = self.state_joint_qd[env_ids, 3:6].clone().detach()
++
++        if not self.visualize:
++            task_names = list(self.task_table.keys())
++            idx = torch.randint(0, self.task_num, (num_reset_envs,))
++            # NOTE: do not modify self.orbit_dir in place: earlier steps' rewards already have it in the graph (multiplied into the tangent),
++            #   one actor update spans 32 steps, and an in-place write after a mid-horizon reset breaks backprop
++            #   (hit on 2026-09-21: "modified by an inplace operation [16, 1]").
++            new_dir = self.orbit_dir.clone()
++            for i in range(num_reset_envs):
++                name = task_names[idx[i].item()]
++                self.task_list[env_ids[i]] = name
++                new_dir[env_ids[i]] = self.task_table[name]
++            self.orbit_dir = new_dir
++
++        self.progress_buf[env_ids] = 0
++        self.calculateObservations()
++        if self.start_mode != 'upstream':
++            # v4: the VAE history starts over (= reset() on the drone). deploy: all zero; deploy_warm: 5 copies of the post-reset observation
++            buf = self.obs_hist_buf.buffer.clone()
++            if self.start_mode == 'deploy':
++                buf[env_ids] = 0.
++            else:
++                buf[env_ids] = self.vae_obs_buf[env_ids].detach().unsqueeze(1).repeat(1, self.num_history, 1)
++            self.obs_hist_buf.buffer = buf
++        return self.obs_buf, self.vlm_feature
++
++    def clear_grad(self, checkpoint=None):
++        # The graph is cut at the start of each BPTT segment (initialize_trajectory); so are the latency model's command history and throttle state
++        super().clear_grad(checkpoint)
++        if self.cmd_latency is not None:
++            self.cmd_latency.detach_state()
++        if self.height_integrator is not None:
++            self.height_integrator.detach_state()
++
++    # ------------------------------------------------------------------
++    def _orbit_geometry(self, pos):
++        d = pos[:, 0:2] - self.orbit_center
++        r = torch.norm(d, dim=1).clamp(min=1e-6)
++        r_hat = d / r.unsqueeze(1)
++        return r, r_hat
++
++    def calculateObservations(self):
++        # NOTE: always clone: the parent's step() writes state_joint_q / qd in place every step. Multiplying slices directly
++        #   stores the slices in the graph, and backprop fails after the next in-place write
++        #   (hit on 2026-09-21: "[16], output 0 of AsStridedBackward0 ... modified by an inplace operation").
++        #   Upstream uses torso_quat.clone() in the same place.
++        torso_pos = self.state_joint_q[:, 0:3].clone()
++        torso_quat = self.state_joint_q[:, 3:7].clone()   # (x,y,z,w)
++        lin_vel = self.state_joint_qd[:, 3:6].clone()
++        ang_vel = self.state_joint_qd[:, 0:3].clone()
++        lin_acceleration = self.state_joint_qdd[:, 3:6].clone()
++
++        up_vec = tu.quat_rotate(torso_quat.clone(), self.up_vec)
++        heading = proper_heading_xy(torso_quat)
++        r, r_hat = self._orbit_geometry(torso_pos)
++        cos_look = (heading * (-r_hat)).sum(dim=-1)        # how well the nose points at the box (for the critic)
++
++        # Rendering: position y, z are negated (upstream convention); the attitude needs the same conversion so the camera matches the nose
++        gs_pos = torso_pos + self.gs_origin_offset
++        gs_pos = torch.stack([gs_pos[:, 0], -gs_pos[:, 1], -gs_pos[:, 2]], dim=1)
++        gs_quat = torso_quat * torch.tensor([1.0, -1.0, -1.0, 1.0], device=self.device)
++        gs_pose = torch.cat([gs_pos, torch.zeros([self.num_envs, 3], device=self.device), gs_quat], dim=-1)
++
++        if not self.visualize:
++            if self.nerf_count % self.nerf_freq == 0:
++                self.time_report.start_timer("3D GS inference")
++                depth_list, nerf_img = self.gs.render(gs_pose)
++                self.time_report.end_timer("3D GS inference")
++                self.process_GS_data(depth_list, nerf_img)
++            self.nerf_count += 1
++        else:
++            img_transform = Resize((360, 640), antialias=True)
++            depth_list, nerf_img = self.gs.render(gs_pose)
++            self.process_GS_data(depth_list, nerf_img)
++            for i, id in enumerate(self.save_indices):
++                img = img_transform(nerf_img[id].permute(2, 0, 1).cpu())
++                self.img_record[i].append((img * 255).clamp(0, 255).to(torch.uint8))
++            rpy = quaternion_to_euler(torso_quat[:, [3, 0, 2, 1]]).detach().cpu().numpy()
++            yaw = torch.atan2(heading[:, 1], heading[:, 0]).detach().cpu().numpy()     # correct yaw
++            pos_d = torso_pos.detach().cpu().numpy(); vel_d = lin_vel.detach().cpu().numpy()
++            ang_d = ang_vel.detach().cpu().numpy(); vae_d = self.lin_vel_vae.detach().cpu().numpy()
++            dep_d = self.depth_list.detach().cpu().numpy(); act_d = self.actions.detach().cpu().numpy()
++            for i, e in enumerate(self.save_indices):
++                self.x_record[i].append(pos_d[e, 0]); self.y_record[i].append(pos_d[e, 1]); self.z_record[i].append(pos_d[e, 2])
++                self.roll_record[i].append(rpy[e, 0]); self.pitch_record[i].append(rpy[e, 1]); self.yaw_record[i].append(yaw[e])
++                self.velo_x_record[i].append(vel_d[e, 0]); self.velo_y_record[i].append(vel_d[e, 1]); self.velo_z_record[i].append(vel_d[e, 2])
++                self.ang_velo_x_record[i].append(ang_d[e, 0]); self.ang_velo_y_record[i].append(ang_d[e, 1]); self.ang_velo_z_record[i].append(ang_d[e, 2])
++                self.vae_velo_x_record[i].append(vae_d[e, 0]); self.vae_velo_y_record[i].append(vae_d[e, 1]); self.vae_velo_z_record[i].append(vae_d[e, 2])
++                self.depth_record[i].append(dep_d[e] / 2)
++                if self.episode_count < self.episode_length:
++                    self.action_record[i, self.episode_count, :] = act_d[e]
++            self.episode_count += 1
++
++        # State for the reward (world frame, no noise), decoupled from the observation layout; read by calculateReward
++        self._rw_pos, self._rw_vel, self._rw_quat = torso_pos, lin_vel, torso_quat
++        self._rw_acc_z = lin_acceleration[:, 2]
++
++        # Attitude and velocity representation (see ORBIT_OBS_FRAME in the header). Both are 4 + 3 numbers; observation size and layout unchanged
++        if self.obs_frame == 'heading':
++            att_obs = tilt_quat(torso_quat)                                   # policy: quaternion without yaw
++            vel_obs = to_heading_frame(lin_vel, heading)                      # policy, critic: forward, left, up
++            x, y, z, w = torso_quat[:, 0], torso_quat[:, 1], torso_quat[:, 2], torso_quat[:, 3]
++            up_body_xy = torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x)], dim=1)
++            att_priv = torch.cat([heading, up_body_xy], dim=1)                # critic: nose direction + tilt
++            vel_priv = vel_obs
++        else:
++            att_obs, vel_obs, att_priv, vel_priv = torso_quat, lin_vel, torso_quat, lin_vel
++
++        latent_ablation = torch.zeros_like(self.latent_vect)
++        torso_pos_noise = self.obs_noise_level * (torch.rand_like(torso_pos) - 0.5)
++        lin_vel_noise = self.obs_noise_level * (torch.rand_like(lin_vel) - 0.5)
++        visual_noise = self.obs_noise_level * (torch.rand_like(self.visual_info) - 0.5)
++        latent_noise = self.obs_noise_level * (torch.rand_like(self.latent_vect) - 0.5)
++        torso_quat_noise = self.obs_noise_level * (torch.rand_like(torso_quat) - 0.5)
++
++        # Privileged observation for the critic: same size as the parent class; column 17 is the cos of the nose-to-box angle
++        # v2 (heading): 3:6 is heading-frame velocity, 9:13 is [hx, hy, up x, up y]; v1: world-frame velocity and quaternion
++        self.privilege_obs_buf = torch.cat([
++            torso_pos,                       # 0:3
++            vel_priv,                        # 3:6
++            lin_acceleration,                # 6:9
++            att_priv,                        # 9:13
++            ang_vel,                         # 13:16
++            up_vec[:, 1:2],                  # 16
++            cos_look.unsqueeze(-1),          # 17
++            self.actions,                    # 18:22
++            self.prev_actions,               # 22:26
++            self.depth_list,                 # 26
++            self.visual_info,
++            self.latent_vect,
++            self.lin_vel_vae,
++        ], dim=-1)
++
++        # Policy observation: same fields as the parent class (no x/y position; the image tells where the box is);
++        # the representation of attitude 2:6 and velocity 14:17 is set by ORBIT_OBS_FRAME
++        self.obs_buf = torch.cat([
++            (torso_pos[:, 2] + torso_pos_noise[:, 2]).unsqueeze(-1),
++            (lin_vel[:, 2] + lin_vel_noise[:, 2]).unsqueeze(-1),
++            att_obs + torso_quat_noise,
++            self.actions,
++            self.prev_actions,
++            vel_obs,
++            self.visual_info + visual_noise,
++            self.latent_vect + latent_noise,
++        ], dim=-1)
++        self.vae_obs_buf = torch.cat([
++            (torso_pos[:, 2] + torso_pos_noise[:, 2]).unsqueeze(-1),
++            (lin_vel[:, 2] + lin_vel_noise[:, 2]).unsqueeze(-1),
++            att_obs + torso_quat_noise,
++            self.actions,
++            self.prev_actions,
++            vel_obs,
++            self.visual_info + visual_noise,
++            latent_ablation,
++        ], dim=-1)
++
++        for name in ("obs_buf", "privilege_obs_buf", "vae_obs_buf"):
++            buf = getattr(self, name)
++            if torch.isnan(buf).any() or torch.isinf(buf).any():
++                print(f"{name} nan")
++                setattr(self, name, torch.nan_to_num(buf, nan=0.0, posinf=1e3, neginf=-1e3))
++
++    # ------------------------------------------------------------------
++    def orbit_terms(self, pos, vel, quat):
++        """Orbit-related reward quantities, kept separate for easy checking (also used by scripted-controller tests)."""
++        r, r_hat = self._orbit_geometry(pos)
++        t_hat = torch.stack([-r_hat[:, 1], r_hat[:, 0]], dim=1) * self.orbit_dir.unsqueeze(1)   # tangent in the commanded direction
++        heading = proper_heading_xy(quat)
++        cos_look = (heading * (-r_hat)).sum(dim=-1)
++        rad_corr = torch.clamp(self.radial_gain * (self.orbit_radius - r), -self.correction_limit, self.correction_limit)
++        z_corr = torch.clamp(self.vertical_gain * (self.orbit_height - pos[:, 2]), -self.correction_limit, self.correction_limit)
++        v_des_xy = self.orbit_speed * t_hat + rad_corr.unsqueeze(1) * r_hat
++        v_des = torch.cat([v_des_xy, z_corr.unsqueeze(1)], dim=1)
++        track_err = torch.sum(torch.square(vel - v_des), dim=-1)
++        return r, cos_look, track_err, v_des
++
++    def orbit_progress(self, pos, vel):
++        """Tangential speed in the commanded direction divided by V, clipped to [-1, 1]: perfect orbit +1, hovering 0, reversed -1 (v2 progress reward)."""
++        _, r_hat = self._orbit_geometry(pos)
++        t_hat = torch.stack([-r_hat[:, 1], r_hat[:, 0]], dim=1) * self.orbit_dir.unsqueeze(1)
++        v_t = torch.sum(vel[:, 0:2] * t_hat, dim=-1)
++        return torch.clamp(v_t / self.orbit_speed, -1.0, 1.0)
++
++    def pop_reward_term_means(self):
++        """Per-term reward means over all steps and environments since the last call (for the training log); resets the accumulators."""
++        if self._term_count == 0:
++            return {}
++        out = {k: float(v) / self._term_count for k, v in self._term_acc.items()}
++        self._term_acc, self._term_count = {}, 0
++        return out
++
++    def calculateReward(self):
++        pos, vel, quat = self._rw_pos, self._rw_vel, self._rw_quat    # true state in the world frame, no noise (x,y,z,w)
++        r, cos_look, track_err, _ = self.orbit_terms(pos, vel, quat)
++
++        survive = torch.full_like(r, self.survive_reward)
++        look = self.look_strength * (1.0 - cos_look)
++        track = self.track_strength * track_err
++        radius = self.radius_penalty * torch.square(r - self.orbit_radius)
++        height = self.height_penalty * torch.square(pos[:, 2] - self.orbit_height)
++        height_change = self.height_change_penalty * torch.square(vel[:, 2])
++        tilt = self.tilt_penalty * 2.0 * (quat[:, 0] ** 2 + quat[:, 1] ** 2)       # = 1 - cos(tilt angle)
++
++        # Action terms: thrust relative to this airframe's hover command, per environment
++        hover_cmd = (self.hover_thrust / self.max_thrust).detach()
++        act, prev_act = self.obs_buf[:, 6:10], self.obs_buf[:, 10:14]
++        action_pen = torch.sum(torch.square(act[:, 0:3]), dim=-1) * self.action_penalty
++        action_pen = action_pen + torch.square(act[:, 3] - hover_cmd) * (2 * self.action_penalty)
++        change_pen = torch.sum(torch.square(act[:, 0:3] - prev_act[:, 0:3]), dim=-1) * self.action_change_penalty
++        change_pen = change_pen + torch.square(act[:, 3] - prev_act[:, 3]) * (2 * self.action_change_penalty)
++        smooth_pen = torch.sum(torch.square(act[:, 0:3] - 2 * prev_act[:, 0:3] + self.prev_prev_actions[:, 0:3]), dim=-1) * self.smooth_penalty
++        smooth_pen = smooth_pen + torch.square(act[:, 3] - 2 * prev_act[:, 3] + self.prev_prev_actions[:, 3]) * (2 * self.smooth_penalty)
++        accel_pen = torch.sum(torch.square(self.prev_lin_vel - vel), dim=-1) * self.lin_vel_rate_penalty
++        jitter = torch.square(self._rw_acc_z) * self.jitter_penalty
++
++        # Upstream's obstacle-distance reward (nearest point in a 120 deg cone in front of the camera), unchanged; v2's cloud has the ground removed (ORBIT_OBST_MIN_Z)
++        self.time_report.start_timer("point cloud collision check")
++        obst_dist = self.point_cloud.compute_nearest_distances(pos + self.point_could_origin_offset, quat[:, [3, 0, 1, 2]])
++        self.time_report.end_timer("point cloud collision check")
++        obst = torch.where(obst_dist < self.obst_threshold, obst_dist * self.obstacle_strength, torch.zeros_like(obst_dist))
++        obst = obst + torch.where(obst_dist < self.obst_collision_limit, torch.ones_like(obst_dist) * self.collision_penalty, torch.zeros_like(obst_dist))
++
++        # v2 orbit progress (v1 weight 0, so this term is always 0)
++        progress = self.progress_strength * self.orbit_progress(pos, vel)
++
++        terms = dict(survive=survive, look=look, track=track, radius=radius, height=height,
++                     height_change=height_change, tilt=tilt, action=action_pen, change=change_pen,
++                     smooth=smooth_pen, accel=accel_pen, jitter=jitter, obst=obst, progress=progress)
++        self.rew_buf = (survive + look + track + radius + height + height_change + tilt
++                        + action_pen + change_pen + smooth_pen + accel_pen + jitter + obst + progress)
++        self.prev_lin_vel = vel.clone().detach()
++        self.last_obst_dist = obst_dist.detach()
++        self.last_reward_terms = {k: v.detach() for k, v in terms.items()}
++        for k, v in self.last_reward_terms.items():       # accumulate on the GPU, read once per iteration, so training is not slowed down
++            self._term_acc[k] = self._term_acc.get(k, 0.0) + v.mean()
++        self._term_acc["total"] = self._term_acc.get("total", 0.0) + self.rew_buf.detach().mean()
++        self._term_count += 1
++
++        # Early termination
++        cond_sanity = ~((~torch.isnan(self.obs_buf) & ~torch.isinf(self.obs_buf)).all(dim=1))
++        cond_body_rate = torch.linalg.norm(self.privilege_obs_buf[:, 13:16], dim=1) > self.body_rate_threshold
++        cond_height = (pos[:, 2] > self.max_height) | (pos[:, 2] < self.min_height)
++        cond_radius = (r < self.min_radius) | (r > self.max_radius)
++        cond_train = self.progress_buf > self.episode_length - 1
++        combined = cond_body_rate | cond_train
++        if self.early_termination:
++            combined = combined | cond_height | cond_radius | cond_sanity
++        self.reset_buf = torch.where(combined, torch.ones_like(self.reset_buf), self.reset_buf)
++
++        if self.visualize:
++            for i, env_id in enumerate(self.save_indices):
++                if self.reset_buf[env_id] == 1:
++                    self.done_record[i] = 1
++                    self.reward_record[i] -= self.rew_buf[env_id]
++                if self.done_record[i] == 0:
++                    self.reward_record[i] -= self.rew_buf[env_id]
++            if self.episode_count == (self.episode_length - 1) or combined.any():
++                self.save_recordings_batch()
+diff --git a/utils/gs_local.py b/utils/gs_local.py
+index 9d4dd87..427bade 100644
+--- a/utils/gs_local.py
++++ b/utils/gs_local.py
+@@ -40,8 +40,15 @@ class GS():
+         self.camera_out.rescale_output_resolution(res)
+        
+     def generate_output_camera(self,width:int,height:int):
+-        fx,fy = 462.956,463.002
+-        cx,cy = 323.076,181.184
++        # This project's camera: Orbbec Gemini 2 (the original uses a RealSense D435)
++        # Factory calibration read from the onboard camera's ROS camera_info on 2026-09-21,
++        # RGB 640x360 (a native mode of the camera, used as is on the drone, no cropping or scaling).
++        # Field of view 85.7 x 55.1 deg. Distortion is at most 1.46 px at the very edge, so an undistorted pinhole camera is fine for rendering.
++        # Values derived earlier from the spec FOV of 86 x 55 deg: fx=fy=343.1, cx,cy=320,180 (0.5% apart).
++        # The original RealSense D435 values: fx,fy = 462.956,463.002 / cx,cy = 323.076,181.184
++        #   (horizontal FOV about 69 deg, much narrower than the Gemini 2)
++        fx,fy = 344.704,344.737
++        cx,cy = 319.146,180.512
+         
+         camera_out = Cameras(
+             camera_to_worlds=1.0*self.camera_ref.camera_to_worlds,
+@@ -139,6 +146,18 @@ def get_gs(map: str, gs_path, resolution) -> 'GS':
+         "gate_right": "sv_917_3_right_nerfstudio",
+         "gate_mid": "sv_1007_gate_mid",
+         "gate_mid_new": "gate_mid_new",
++        # Scenes added by this project. Values are paths under envs/assets/gs_data/; get_gs searches them
++        # recursively for config.yml. They point at a single timestamp because
++        # outputs/scene04/splatfacto/ holds two training runs (identical except for the timestamp),
++        # and without it, which one os.walk finds first is undefined.
++        # scene04 and outputs in envs/assets/gs_data/ are symlinks into
++        # the scene workspace (repos/SousVide/gsplats/workspace/); config.yml stores
++        # relative paths (data: scene04, output_dir: outputs) and get_gs chdirs
++        # into gs_data before loading, so this layout is required.
++        "scene04": "outputs/scene04/splatfacto/2026-08-30_221930",
++        # 2026-09-21 sunny baseball field (orbit-the-box task). envs/assets/gs_data/sunny_baseball_field
++        # is a symlink to workspace/sunny_baseball_field (the data field of config.yml).
++        "sunny_baseball_field": "outputs/sunny_baseball_field/splatfacto/2026-09-21_190438",
+     }
+ 
+     map_folder = os.path.join(gs_data_root, maps[map])
+@@ -214,11 +233,26 @@ def pose2nerf_transform(positions: torch.Tensor, quaternions: torch.Tensor, devi
+     batch_size = positions.size(0)
+ 
+     # Fixed transformation matrices
++    # Camera mounting extrinsics on the airframe (this project).
++    # NOTE: axes are x forward / y right / z down (PX4 body FRD), not x forward / y left / z up.
++    #   Verified numerically with this function on 2026-09-21 (body at the origin, yaw 0):
++    #     positive y translation -> camera right of the body; positive z -> camera below the body;
++    #     rotation [[cos,0,sin],[0,1,0],[-sin,0,cos]] with a positive angle -> camera pitched up.
++    #   The comment here used to state all three the wrong way round (y left, z up, positive angle = down).
++    # Origin = centre of the Pixhawk 6X flight-controller module (PX4 EKF2_IMU_POS_X/Y/Z are all 0,
++    #   so the position PX4 reports is the IMU position).
++    # This project (measured on the drone, 2026-09-21):
++    #   the Gemini 2's RGB lens is 9.1 cm forward, 1.1 cm left and 0.75 cm up from the flight controller centre, mounted level.
++    #   forward 9.1: FC centre to the lens front surface; up 0.75: lens level with the top of the FC module (about 1.5 cm thick);
++    #   left 1.1: camera centred, RGB lens 10.8 mm left of the housing centre (from the official front drawing).
++    #   -> FRD translation [0.091, -0.011, -0.0075], identity rotation.
++    # Original carl: [0.152, -0.031, -0.012] + a rotation of +8.05 deg about y
++    #   = 15.2 cm forward, 3.1 cm left, 1.2 cm up, camera pitched up 8 deg (the nose dips in fast flight, so the camera looks ahead).
+     T_r2d = torch.tensor([
+-        [0.990, 0.000, 0.140, 0.152],
+-        [0.000, 1.000, 0.000, -0.031],
+-        [-0.140, 0.000, 0.990, -0.012],
+-        [0.000, 0.000, 0.000, 1.000]
++        [1.000, 0.000, 0.000,  0.0910],
++        [0.000, 1.000, 0.000, -0.0110],
++        [0.000, 0.000, 1.000, -0.0075],
++        [0.000, 0.000, 0.000,  1.0000]
+     ], dtype=torch.float32, device=device).expand(batch_size, -1, -1)  # Shape: (n, 4, 4)
+ 
+     T_f2n = torch.tensor([
+diff --git a/utils/video_io.py b/utils/video_io.py
+new file mode 100644
+index 0000000..8b56045
+--- /dev/null
++++ b/utils/video_io.py
+@@ -0,0 +1,69 @@
++"""
++Replacement for write_video (added in this project).
++
++torchvision deprecated its video I/O in 0.22 and removed it in 0.26, so
++`from torchvision.io import write_video` fails with:
++
++    ImportError: cannot import name 'write_video' from 'torchvision.io'
++
++Five grad_nav environment files use it to save ego_video.mp4. This module provides a
++drop-in replacement with the same name and signature, based on imageio + imageio-ffmpeg;
++callers only change the import line.
++
++The calls are always:
++    write_video(path, tensor_uint8_THWC, fps=20)
++"""
++from pathlib import Path
++
++import numpy as np
++
++
++def write_video(filename, video_array, fps, video_codec="libx264", options=None):
++    """Write frames to a video file.
++
++    Args:
++        filename: output path.
++        video_array: (T, H, W, C) uint8 frames, torch.Tensor or numpy.
++                     Float input is treated as [0,1] and converted to uint8.
++        fps: frame rate.
++        video_codec: encoder, default libx264 (same as torchvision).
++        options: extra ffmpeg parameters as a dict, passed as output_params.
++
++    Differences from the torchvision version:
++        - no audio_array (grad_nav does not use it).
++        - macro_block_size=1, so the image is never silently rescaled to a multiple of 16.
++          torchvision does not do that, but imageio does by default, which would make the saved
++          video resolution differ from what the policy actually sees.
++    """
++    import imageio.v2 as imageio
++
++    arr = video_array
++    if hasattr(arr, "detach"):                      # torch.Tensor
++        arr = arr.detach().cpu().numpy()
++    arr = np.asarray(arr)
++
++    if arr.dtype != np.uint8:                       # float input is treated as [0,1]
++        arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
++
++    if arr.ndim != 4 or arr.shape[-1] not in (1, 3):
++        raise ValueError(
++            f"write_video needs (T, H, W, C) with C = 1 or 3, got {arr.shape}")
++    if arr.shape[-1] == 1:
++        arr = np.repeat(arr, 3, axis=-1)
++
++    # H.264 yuv420p needs even width and height. With odd sizes libx264 fails,
++    # but imageio raises nothing and leaves an unreadable file (moov atom not found).
++    # A silent failure like that is hard to track down, so pad one row/column of edge pixels and warn.
++    h, w = arr.shape[1], arr.shape[2]
++    if h % 2 or w % 2:
++        import warnings
++        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
++        warnings.warn(
++            f"write_video: {w}x{h} has an odd side, which H.264 does not support; "
++            f"padded to {arr.shape[2]}x{arr.shape[1]}", stacklevel=2)
++
++    Path(filename).parent.mkdir(parents=True, exist_ok=True)
++    kwargs = dict(fps=fps, codec=video_codec, quality=8, macro_block_size=1)
++    if options:
++        kwargs["output_params"] = [x for kv in options.items() for x in kv]
++    imageio.mimwrite(filename, list(arr), **kwargs)

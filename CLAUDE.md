@@ -72,10 +72,14 @@ Do not skip ahead in the implementation order; every stage has a clearly **verif
 grad_nav hard-codes the original authors' hardware and scenes in several places; these **must be changed** when switching to our own environment:
 
 1. The camera intrinsics in `utils/gs_local.py`: `fx=462.956, fy=463.002, cx=323.076, cy=181.184` (640×360): this is a RealSense D435
-2. The three constant matrices in `pose2nerf_transform()` in `utils/gs_local.py`, where `T_r2d` is the camera's **mounting extrinsics** on the vehicle (15.2 cm forward, tilted down 8°)
+2. The three constant matrices in `pose2nerf_transform()` in `utils/gs_local.py`, where `T_r2d` is the camera's **mounting extrinsics** on the vehicle, in body FRD (x forward, y right, z down): 15.2 cm forward, 3.1 cm left, 1.2 cm up, pitched **up** 8° (the upstream comment states the directions backwards)
 3. `utils/gs_local.py` and `envs/*.py` each have their own `maps` dict; **add** our scene **to both**
 4. `gs_origin_offset = [-6.0, 0, 0]` in `envs/drone_long_traj.py`
 5. The `task_table` in `envs/drone_vla_*.py`: instruction strings and their waypoints must be replaced with our own tasks
+6. **The camera looks in the mirror image of the body yaw**: the environments negate y and z of the position before the renderer but not the quaternion, so with body yaw psi the camera looks at -psi. Harmless while yaw stays near 0; any task that turns must convert the quaternion too
+7. The thrust penalty in each environment's `calculateReward` is hard-coded around `0.42` (carl's hover command; this airframe is about 0.24), and the same block adds a `torch.sum` over the whole batch to every environment
+
+`configs/grad_nav/grad_nav_simulator_v4.patch` makes all of these changes for this project's drone and scenes; it is the simulator the published orbit policy (`orbit_policy/`) was trained in. The training-side changes are not published.
 
 ## Managing expectations
 

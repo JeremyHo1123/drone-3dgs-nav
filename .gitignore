@@ -13,6 +13,14 @@
 !/notes/
 !/configs/
 !/scenes/
+!/orbit_policy/
+
+# ── policy weights live in the orbit-policy-v4 release, not in git ──
+orbit_policy/bundle*/
+*.pt
+
+# ── a scene's workspace/ is a local copy laid out for loading (see each scene's README) ──
+scenes/**/workspace/
 
 # ── notes/ keeps its text; the screenshots stay local ──
 notes/**/*.png
